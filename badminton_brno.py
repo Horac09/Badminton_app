@@ -4,19 +4,26 @@ Badminton Brno - přehled volných kurtů
   * TJ Tesla Brno – Lesná (Reenio)
   * Xarena Slatina (Bizzy / e-rezervace.cz)
   * Centrum Viktoria (Clubspire timeline)
-  * Ivanovice (Memberzone)
+  * Ivanovice (Memberzone – rozpis)
+  * Hala Sprint (Memberzone – Sportoviste.aspx)
 
 Spuštění:
     pip install requests tzdata
-    python badminton_brno.py                             # web (http://localhost:8765 nebo jiný volný port)
+    python badminton_brno.py                             # web (http://localhost:8765)
+    python badminton_brno.py --host 0.0.0.0              # web dostupný i z mobilu na stejné Wi-Fi
     python badminton_brno.py --cli                       # výpis volných slotů do konzole
     python badminton_brno.py --export site               # statický web pro mobil (GitHub Pages)
-    python badminton_brno.py --dump                      # surová data Reenio -> reenio_dump.json
-    python badminton_brno.py --dump-xarena 25.11.2026    # surové HTML Xarena -> xarena_dump*.html
+    python badminton_brno.py --dump-xarena 25.11.2026    # ladění jednotlivých hal
     python badminton_brno.py --dump-viktoria 25.11.2026
     python badminton_brno.py --dump-memberzone 01.12.2026
+    python badminton_brno.py --dump-sprint
+
+JAK PŘIDAT DALŠÍ HALU / KURTY (viz KONFIGURACE níže):
+  * Reenio (jako TJ Tesla)        -> přidat kurt do VENUES[..]["resources"] nebo novou položku do VENUES
+  * Memberzone Sportoviste.aspx   -> přidat položku do SPORTOVISTE (stačí URL stránky sportoviště)
+  * jiný rezervační systém        -> potřeba nový adaptér (pošlete cURL)
 """
-import argparse, json, re, threading, time, html as htmlmod, datetime as dt
+import argparse, json, os, re, threading, time, html as htmlmod, datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -32,6 +39,7 @@ RETRIES = 3               # kolikrát zkusit den znovu při výpadku spojení
 MAX_FAILS_IN_ROW = 3      # po tolika neúspěšných dnech za sebou web v tomto kole vzdáme
 GRID_STEP_MIN = 30        # řádek mřížky = 30 min
 
+# --- Reenio
 VENUES = [
     {
         "name": "TJ Tesla Brno – Lesná",
@@ -45,36 +53,49 @@ VENUES = [
     },
 ]
 
+# --- Bizzy / e-rezervace
 XARENA = {
     "name": "Xarena Slatina",
     "url": "https://xarena.e-rezervace.cz/Branch/pages/Schedule.faces",
     "service_id": "40106",        # výběr služby badminton
-    "days_ahead": 14,             # rezervace dnes + 14 dní
+    "days_ahead": 14,
     "parallel": 3,
-    "cookie": "",                 # volitelně JSESSIONID přihlášeného prohlížeče (není potřeba)
+    "cookie": "",
 }
 
+# --- Clubspire timeline
 VIKTORIA = {
     "name": "Centrum Viktoria",
     "base": "https://rezervace.centrumviktoria.cz:18443",
     "sport_index": 1,      # tc[1].s=true = badminton
-    "sport_count": 5,      # tc[0]..tc[4]
-    "days_ahead": 14,      # rezervace do dnes + 14 dní (23:59)
-    "parallel": 1,         # server shazuje souběžná spojení -> jen jedno najednou
-    "delay": 1.0,          # pauza mezi dny (s)
-    "enabled": True,       # False = nenačítat (např. na firemní síti/VPN, která Viktorii blokuje)
+    "sport_count": 5,
+    "days_ahead": 14,
+    "parallel": 1,         # server shazuje souběžná spojení
+    "delay": 1.0,
+    "enabled": True,       # False = nenačítat (např. na firemní VPN, která Viktorii blokuje)
 }
 
+# --- Memberzone rozpis (Ivanovice)
 MEMBERZONE = {
     "name": "Ivanovice (Memberzone)",
     "url": "https://memberzone.cz/ivanovice/",
-    "sport_name": "Badminton",    # tlačítko sportu na stránce
+    "sport_name": "Badminton",
     "days_ahead": 14,
     "parallel": 3,
 }
 
+# --- Memberzone Sportoviste.aspx (týdenní přehled volných začátků) – lze přidat další kluby
+SPORTOVISTE = [
+    {
+        "name": "Hala Sprint",
+        "url": "https://memberzone.cz/sprint_tenis/Sportoviste.aspx?ID_Sportoviste=3&NAZEV=Badminton+hala",
+        "days_ahead": 14,
+    },
+]
+
 # pořadí sloupců v mřížce
-VENUE_ORDER = [v["name"] for v in VENUES] + [XARENA["name"], VIKTORIA["name"], MEMBERZONE["name"]]
+VENUE_ORDER = ([v["name"] for v in VENUES] + [XARENA["name"], VIKTORIA["name"], MEMBERZONE["name"]]
+               + [s["name"] for s in SPORTOVISTE])
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
@@ -86,7 +107,6 @@ def host_slot(host, n=PER_HOST):
 NET_ERRORS = (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError)
 
 def _short(e):
-    """Čitelný popis chyby (např. 'ConnectionResetError 10054 …')."""
     s = str(e)
     m = re.search(r"(\w+Error)\((\d+),\s*'([^']+)'", s)
     if m:
@@ -95,12 +115,7 @@ def _short(e):
     return (e.__class__.__name__ + ": " + s)[:200]
 
 def fetch_days(make_client, fetch, days, label, delay=0.0):
-    """
-    Stáhne dny jedním klientem.
-      * výpadek spojení -> počká a zkusí den znovu s novým klientem (max. RETRIES pokusů)
-      * MAX_FAILS_IN_ROW neúspěšných dnů za sebou -> zbytek dnů přeskočí (šetří server)
-    Vrací (výsledky, chyby).
-    """
+    """Stáhne dny jedním klientem; při výpadku spojení opakuje, po MAX_FAILS_IN_ROW chybách skončí."""
     client, out, errs = make_client(), [], []
     fails_in_row = 0
     for i, d in enumerate(days):
@@ -118,7 +133,7 @@ def fetch_days(make_client, fetch, days, label, delay=0.0):
                     client = make_client()
             except Exception as e:
                 errs.append(f"{label} {d:%d.%m.}: {_short(e)}")
-                client = make_client()           # po chybě serveru začít s čistou session
+                client = make_client()
                 break
         fails_in_row = 0 if ok else fails_in_row + 1
         if fails_in_row >= MAX_FAILS_IN_ROW and i + 1 < len(days):
@@ -128,6 +143,25 @@ def fetch_days(make_client, fetch, days, label, delay=0.0):
         if delay:
             time.sleep(delay)
     return out, errs
+
+def form_fields(html):
+    """Všechna pole ASP.NET formuláře: <input> (kromě tlačítek) + <select> (vybraná hodnota)."""
+    out = {}
+    for tag in re.findall(r"<input\b[^>]*>", html, re.I):
+        n = re.search(r'\bname="([^"]+)"', tag)
+        if not n:
+            continue
+        t = re.search(r'\btype="([^"]+)"', tag)
+        if t and t.group(1).lower() in ("submit", "button", "image", "checkbox", "radio"):
+            continue
+        v = re.search(r'\bvalue="([^"]*)"', tag)
+        out[htmlmod.unescape(n.group(1))] = htmlmod.unescape(v.group(1)) if v else ""
+    for m in re.finditer(r'<select\b[^>]*name="([^"]+)"[^>]*>(.*?)</select>', html, re.S | re.I):
+        opts = re.findall(r'<option\b([^>]*)value="([^"]*)"', m.group(2))
+        sel = [v for a, v in opts if "selected" in a] or [v for a, v in opts[:1]]
+        if sel:
+            out[htmlmod.unescape(m.group(1))] = htmlmod.unescape(sel[0])
+    return out
 
 # ---------------------------------------------------------------- ADAPTÉR REENIO
 class ReenioClient:
@@ -174,10 +208,6 @@ class ReenioClient:
 
 # ---------------------------------------------------------------- ADAPTÉR BIZZY / E-REZERVACE (Xarena)
 class XarenaClient:
-    """
-    JSF + RichFaces. Akce kalendáře nepřihlášeného = j_id209, výběr služby = j_id214.
-    Odpověď j_id209 obsahuje jen oblast rozvrhu (bez políčka s datem) -> den = požadovaný den.
-    """
     SUBMIT_CANDIDATES = ["scheduleNavigForm:j_id209", "scheduleNavigForm:j_id211",
                          "scheduleNavigForm:j_id204"]
 
@@ -249,7 +279,6 @@ class XarenaClient:
         return r.text
 
     def fetch(self, date):
-        """Vrací (den, html). Ověří, že odpověď obsahuje rozvrh a případné datum sedí."""
         tried = []
         for sid in [self.submit_id] + [c for c in self.SUBMIT_CANDIDATES if c != self.submit_id]:
             for fresh in (False, True):
@@ -266,10 +295,8 @@ class XarenaClient:
                 tried.append(f"{sid.split(':')[1]}{'+nová session' if fresh else ''} -> {info}")
         raise RuntimeError(f"Xarena nevrátila den {date:%d.%m.%Y} (zkoušeno: {'; '.join(tried)})")
 
-# ---------------------------------------------------------------- ADAPTÉR CENTRUM VIKTORIA (Clubspire timeline)
+# ---------------------------------------------------------------- ADAPTÉR CENTRUM VIKTORIA
 class ViktoriaClient:
-    """POST /timeline/day: tc[i].s = zaškrtnutý sport, criteriaTimestamp = den (ms), _csrf = token ze stránky.
-    Server zavírá keep-alive spojení -> každý požadavek posílá 'Connection: close' (nové spojení)."""
     def __init__(self, cfg=VIKTORIA):
         self.c = cfg
         self.s = requests.Session()
@@ -293,7 +320,6 @@ class ViktoriaClient:
 
     @staticmethod
     def _ts(date):
-        """Den -> ms epoch (poledne místního času)."""
         noon = dt.datetime.combine(date, dt.time(12, 0))
         if TZ:
             return int(noon.replace(tzinfo=TZ).timestamp() * 1000)
@@ -316,19 +342,10 @@ class ViktoriaClient:
         self.csrf = self._csrf(r.text) or self.csrf
         return r.text
 
-# ---------------------------------------------------------------- ADAPTÉR MEMBERZONE (Ivanovice, ASP.NET WebForms + DevExpress)
+# ---------------------------------------------------------------- ADAPTÉR MEMBERZONE ROZPIS (Ivanovice)
 class MemberzoneClient:
-    """
-    1) GET stránky, 2) postback tlačítkem sportu (Badminton), 3) postback datepickeru s novým dnem.
-    Každá odpověď = celá stránka (~75 kB) s novým __VIEWSTATE.
-
-    Server vracel HTTP 500 pro dny v jiném měsíci (1.12.+), i když je lze rezervovat.
-    Pravděpodobná příčina: stav kalendáře (visibleDate, DATUM_HF). Proto se zkouší
-    několik variant formuláře; funkční varianta se zapamatuje.
-    """
+    """GET -> postback tlačítka sportu -> postback datepickeru. Datum v kalendáři MM/dd/yyyy s nulami."""
     DP = "ASPxFormLayout2$Datepicker2"
-    # "prev" = přesně jako prohlížeč: visibleDate/initialVisibleDate = dosud zobrazený den,
-    # selectedDates = nový den, vše MM/dd/yyyy s nulami (ověřeno z cURL pro 1.12.)
     VARIANTS = ["prev", "target", "prev+hf", "target+hf"]
 
     def __init__(self, cfg=MEMBERZONE):
@@ -345,23 +362,10 @@ class MemberzoneClient:
         self.first_html = ""
         self.sport_html = ""
 
-    @staticmethod
-    def _inputs(html):
-        """Všechna <input name=… value=…> kromě tlačítek/checkboxů -> dict."""
-        out = {}
-        for tag in re.findall(r"<input\b[^>]*>", html, re.I):
-            n = re.search(r'\bname="([^"]+)"', tag)
-            if not n:
-                continue
-            t = re.search(r'\btype="([^"]+)"', tag)
-            if t and t.group(1).lower() in ("submit", "button", "image", "checkbox", "radio"):
-                continue
-            v = re.search(r'\bvalue="([^"]*)"', tag)
-            out[htmlmod.unescape(n.group(1))] = htmlmod.unescape(v.group(1)) if v else ""
-        return out
+    _inputs = staticmethod(form_fields)
 
     def _post(self, extra):
-        f = self._inputs(self.html)
+        f = form_fields(self.html)
         f.update(extra)
         r = self.s.post(self.c["url"], data=f, timeout=30, headers={
             "origin": "https://memberzone.cz", "referer": self.c["url"],
@@ -396,8 +400,7 @@ class MemberzoneClient:
 
     @staticmethod
     def error_title(html):
-        """Z chybové stránky ASP.NET vytáhne popis výjimky."""
-        for pat in (r"<title>\s*(.*?)\s*</title>", r"<h2>\s*<i>(.*?)</i>", r"Exception Details:\s*</b>(.*?)<br"):
+        for pat in (r"<title>\s*(.*?)\s*</title>", r"<h2>\s*<i>(.*?)</i>"):
             m = re.search(pat, html or "", re.S | re.I)
             if m and m.group(1).strip():
                 return re.sub(r"<[^>]+>|\s+", " ", m.group(1)).strip()[:200]
@@ -407,7 +410,6 @@ class MemberzoneClient:
         q = "&quot;"
         prev = self.shown_date(self.html) or dt.date.today()
         vis = prev if variant.startswith("prev") else date
-        # DevExpress parsuje stav kalendáře striktně jako MM/dd/yyyy -> dny 1–9 musí mít nulu (12/01/2026)
         us = lambda d: f"{d.month:02d}/{d.day:02d}/{d.year}"
         ms = int(dt.datetime.combine(date, dt.time()).replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
         f = {
@@ -429,15 +431,13 @@ class MemberzoneClient:
             return self.html
         self.tried = []
         order = [self.variant] + [v for v in self.VARIANTS if v != self.variant]
-        last_exc = None
         for variant in order:
             try:
                 html = self._post(self._form(date, variant))
             except requests.HTTPError as e:
                 code = e.response.status_code if e.response is not None else "?"
                 self.tried.append(f"{variant} -> HTTP {code}")
-                last_exc = e
-                self._new_session(); self._init_session()    # po chybě serveru čistý start
+                self._new_session(); self._init_session()
                 continue
             got = self.shown_date(html)
             if got and got != date:
@@ -447,7 +447,48 @@ class MemberzoneClient:
             return html
         detail = self.error_title(self.last_error_html)
         raise RuntimeError(f"Memberzone neukázal {date:%d.%m.%Y} (zkoušeno: {'; '.join(self.tried)})"
-                           + (f" – server: {detail}" if detail else "")) from last_exc
+                           + (f" – server: {detail}" if detail else ""))
+
+# ---------------------------------------------------------------- ADAPTÉR MEMBERZONE SPORTOVISTE (Hala Sprint)
+class SportovisteClient:
+    """
+    Stránka Sportoviste.aspx ukazuje týden. Pro každý volný začátek je na stránce blok skrytých polí:
+      ctlNN$hfDatumCas  = "20. 11. 2026 7:00:00"   (začátek)
+      ctlNN$hfDelka     = "60"                     (délka rezervace v min)
+      ctlNN$hfKurtyName = "Badminton kurt č.3,Badminton kurt č.4"   (volné kurty)
+    Další týden = postback __EVENTTARGET=btnNext.
+    """
+    def __init__(self, cfg):
+        self.c = cfg
+        self.s = requests.Session()
+        self.s.headers.update({"user-agent": UA, "accept-language": "cs,en;q=0.9"})
+        self.pages = []
+
+    def _post_next(self, html):
+        f = form_fields(html)
+        f.update({"__EVENTTARGET": "btnNext", "__EVENTARGUMENT": ""})
+        r = self.s.post(self.c["url"], data=f, timeout=30, headers={
+            "origin": "https://memberzone.cz", "referer": self.c["url"],
+            "content-type": "application/x-www-form-urlencoded"})
+        r.raise_for_status()
+        return r.text
+
+    def fetch_all(self, until):
+        """Stáhne týdny, dokud nepokryje datum `until` (max. 4 týdny)."""
+        r = self.s.get(self.c["url"], timeout=30)
+        r.raise_for_status()
+        html = r.text
+        self.pages = [html]
+        for _ in range(4):
+            days = {s["start"][:10] for s in parse_sportoviste(html, dt.datetime(2000, 1, 1))}
+            if not days or max(days) >= until.isoformat():
+                break
+            html = self._post_next(html)
+            new_days = {s["start"][:10] for s in parse_sportoviste(html, dt.datetime(2000, 1, 1))}
+            if not new_days or new_days <= days:
+                break
+            self.pages.append(html)
+        return self.pages
 
 # ---------------------------------------------------------------- POMOCNÉ
 try:
@@ -498,7 +539,6 @@ DOW = "Po Út St Čt Pá So Ne".split()
 
 # ---------------------------------------------------------------- PARSER Reenio
 def parse_terms(data, now=None):
-    """Bloky podle reservationIntervalSize. free: True=volno, None=rezervace ještě neotevřena, False=obsazeno."""
     now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
     out = []
     fmt = lambda x: x.strftime("%Y-%m-%d %H:%M")
@@ -530,8 +570,6 @@ def parse_terms(data, now=None):
 
 # ---------------------------------------------------------------- PARSER Xarena
 def parse_xarena(html, now=None, day=None):
-    """Sloupce = hodiny (scheduleTimeHeader), řádky = kurty (horizontalRowHeader),
-    obsazenost = scheduleData.events[] se start/end [sloupec, řádek]."""
     now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
     m = re.search(r'schedule_calendarInputDate"[^>]*value="(\d{1,2})\.(\d{1,2})\.(\d{4})"', html)
     if m:
@@ -567,7 +605,6 @@ _VK_CELL = re.compile(
     r'href=\'([^\']*reservationStartTime/(\d{4}-\d\d-\d\dT\d\d:\d\d)[^\']*)\'(.*?)</td>', re.S)
 
 def parse_viktoria(html, now=None):
-    """'can_book' = volno, 'full_substitute can_book_substitute' = obsazeno (jen náhradník)."""
     now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
     out = []
     for m in _VK_CELL.finditer(html):
@@ -586,16 +623,11 @@ def parse_viktoria(html, now=None):
                     "price": int(price.group(1)) if price else None})
     return out
 
-# ---------------------------------------------------------------- PARSER Memberzone (Ivanovice)
+# ---------------------------------------------------------------- PARSER Memberzone rozpis (Ivanovice)
 _MZ_ROW = re.compile(r'<tr id="[^"]*RADEK_DAY_\d+"[^>]*>\s*<td[^>]*class="color_tmava_bcg">([^<]+)</td>(.*?)</tr>', re.S)
 _MZ_CELL = re.compile(r'<td id="[^"]*_(\d{3})(\d{2})(\d{2})" colspan="(\d+)">\s*<input\b([^>]*)>', re.S)
 
 def parse_memberzone(html, now=None, day=None, first_hour=6):
-    """
-    Řádek = kurt ("Badminton 1"), buňka = 30min slot.
-    ID buňky: <kurt 3 číslice><hodina, 01 = 6:00><čtvrthodina, 01 = :00, 03 = :30>.
-    Volno = <input class="btnrez"> bez disabled; "Blokováno" = obsazeno.
-    """
     now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
     m = re.search(r'name="DATUM_HF"[^>]*value="(\d{1,2})\.(\d{1,2})\.(\d{4})"', html)
     if m:
@@ -615,7 +647,42 @@ def parse_memberzone(html, now=None, day=None, first_hour=6):
                         "free": free, "opens": None, "price": None, "block": block})
     return out
 
-# ---------------------------------------------------------------- NAČÍTÁNÍ (paralelně, průběžně)
+# ---------------------------------------------------------------- PARSER Memberzone Sportoviste (Hala Sprint)
+_SP_FIELD = re.compile(r'<input\b[^>]*name="(ctl\d+)\$(hfDatumCas|hfDelka|hfKurtyName)"[^>]*>', re.I)
+
+def parse_sportoviste(html, now=None):
+    """
+    Z bloků 'volný začátek + délka + volné kurty' vyrobí 30min volné bloky po kurtech.
+    Začátek t s délkou 60 min u kurtu K => K je volný t..t+60.
+    """
+    now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
+    blocks = {}
+    for m in _SP_FIELD.finditer(html):
+        v = re.search(r'\bvalue="([^"]*)"', m.group(0))
+        blocks.setdefault(m.group(1), {})[m.group(2)] = htmlmod.unescape(v.group(1)) if v else ""
+    free = {}                                    # kurt -> [(od, do)]
+    for b in blocks.values():
+        m = re.match(r"\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})\s+(\d{1,2}):(\d{2})", b.get("hfDatumCas", ""))
+        if not m:
+            continue
+        t0 = dt.datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)), int(m.group(4)), int(m.group(5)))
+        t1 = t0 + dt.timedelta(minutes=int(b.get("hfDelka") or 60))
+        for court in filter(None, (c.strip() for c in b.get("hfKurtyName", "").split(","))):
+            free.setdefault(court, []).append((t0, t1))
+    out, step = [], dt.timedelta(minutes=30)
+    for court, iv in free.items():
+        name = re.sub(r"(?i)badminton\s+kurt\s*č\.?\s*", "Kurt ", court)
+        for a, b in _merge(iv):
+            t = a
+            while t + step <= b:
+                if t >= now:
+                    out.append({"court": name, "start": t.strftime("%Y-%m-%d %H:%M"),
+                                "end": (t + step).strftime("%Y-%m-%d %H:%M"),
+                                "free": True, "opens": None, "price": None, "block": 30})
+                t += step
+    return out
+
+# ---------------------------------------------------------------- NAČÍTÁNÍ
 STATE = {"results": {}, "updated": None, "errors": [], "done": 0, "total": 0, "loading": False}
 _lock = threading.Lock()
 
@@ -682,6 +749,31 @@ def _memberzone_task(days):
         return view
     return (f'memberzone|{days[0]}', run)
 
+def _sportoviste_task(cfg):
+    def run():
+        until = dt.date.today() + dt.timedelta(days=cfg.get("days_ahead", DAYS_AHEAD))
+        with host_slot("memberzone", 3):
+            pages = None
+            for attempt in range(1, RETRIES + 1):
+                try:
+                    pages = SportovisteClient(cfg).fetch_all(until)
+                    break
+                except NET_ERRORS:
+                    if attempt == RETRIES:
+                        raise
+                    time.sleep(2.0 * attempt)
+        def view(now):
+            seen, res = set(), []
+            for html in pages:
+                for t in parse_sportoviste(html, now):
+                    k = (t["court"], t["start"])
+                    if k not in seen and t["start"][:10] <= until.isoformat():
+                        seen.add(k)
+                        res.append({**t, "venue": cfg["name"], "link": cfg["url"]})
+            return res
+        return view
+    return (f'sportoviste|{cfg["name"]}', run)
+
 def build_tasks():
     today = dt.date.today()
     tasks = []
@@ -696,12 +788,13 @@ def build_tasks():
             tasks.append(_viktoria_task(ch))
     for ch in _chunks(_days(MEMBERZONE["days_ahead"]), MEMBERZONE["parallel"]):
         tasks.append(_memberzone_task(ch))
+    for cfg in SPORTOVISTE:
+        tasks.append(_sportoviste_task(cfg))
     return tasks
 
 _collect_lock = threading.Lock()
 
 def collect():
-    """Načte vše. Pokud už načítání běží, nic nedělá (ruční a automatická obnova se nepřekrývají)."""
     if not _collect_lock.acquire(blocking=False):
         return False
     try:
@@ -729,7 +822,7 @@ def _collect():
                 try:
                     STATE["results"][key] = f.result()
                 except Exception as e:
-                    STATE["errors"].append(f"{key}: {e}")
+                    STATE["errors"].append(f"{key}: {_short(e)}")
                 STATE["done"] += 1
     valid = {k for k, _ in tasks}
     with _lock:
@@ -784,12 +877,11 @@ def _cell_html(lst):
     for s in sorted(lst, key=lambda s: _court_key(s["court"])):
         extra = f' · {s["price"]} Kč/{s["block"]} min' if s.get("price") else ""
         st = "" if s["free"] else f' <i>(rezervace od {s["opens"]})</i>'
-        items.append(f'<li><a href="{s["link"]}" target=_blank>{htmlmod.escape(s["court"])}</a>'
+        items.append(f'<li><a href="{htmlmod.escape(s["link"])}" target=_blank>{htmlmod.escape(s["court"])}</a>'
                      f' <small>{s["start"][11:]}–{s["end"][11:]}{extra}</small>{st}</li>')
     return cls, f'<details><summary>{label}</summary><ul>{"".join(items)}</ul></details>'
 
 def render_grid(slots, day, show_later):
-    """Hodinové bloky se spojí přes 2 řádky (rowspan=2), půlhodinové zůstávají samostatně."""
     times, cells = build_grid(slots, day, show_later)
     venues = list(VENUE_ORDER)
     if not times:
@@ -839,7 +931,7 @@ def render_list(slots, day, show_later, show_all):
         rows.append(f'<tr><td>{DOW[d.weekday()]} {d:%d.%m.}</td>'
                     f'<td>{s["start"][11:]}–{s["end"][11:]}</td><td>{s["venue"]}</td>'
                     f'<td>{s["court"]}</td><td class={cls}>{txt}</td><td>{price}</td>'
-                    f'<td><a href="{s["link"]}" target=_blank>Otevřít rezervaci</a></td></tr>')
+                    f'<td><a href="{htmlmod.escape(s["link"])}" target=_blank>Otevřít rezervaci</a></td></tr>')
     return ("<table class=list><tr><th>Den</th><th>Čas</th><th>Hala</th><th>Kurt</th><th>Stav</th>"
             "<th>Cena</th><th></th></tr>" + ("".join(rows) or "<tr><td colspan=7>Nic nenalezeno</td></tr>")
             + "</table>")
@@ -889,7 +981,8 @@ details ul{margin:6px 0 0 0;padding-left:18px}details li{margin:2px 0}
 %(errs)s</html>"""
 
 def _max_days():
-    return max(DAYS_AHEAD, XARENA["days_ahead"] + 1, VIKTORIA["days_ahead"] + 1, MEMBERZONE["days_ahead"] + 1)
+    return max([DAYS_AHEAD, XARENA["days_ahead"] + 1, VIKTORIA["days_ahead"] + 1, MEMBERZONE["days_ahead"] + 1]
+               + [s.get("days_ahead", DAYS_AHEAD) + 1 for s in SPORTOVISTE])
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -910,13 +1003,11 @@ class H(BaseHTTPRequestHandler):
         if show_later: params["later"] = 1
         if show_all: params["all"] = 1
         link = lambda **kw: "?" + urlencode({k: v for k, v in {**params, **kw}.items() if v is not None})
-
         days = []
         for i in range(_max_days()):
             d = today + dt.timedelta(days=i)
             sel = " class=sel" if d.isoformat() == day else ""
             days.append(f'<a{sel} href="{link(d=d.isoformat())}">{DOW[d.weekday()]} {d:%d.%m.}</a>')
-
         toggles = [
             f'<a href="{link(v="list" if view == "grid" else "grid")}">'
             f'{"📋 Seznam" if view == "grid" else "▦ Mřížka"}</a>',
@@ -925,10 +1016,8 @@ class H(BaseHTTPRequestHandler):
         ]
         if view == "list":
             toggles.append(f'<a href="{link(all=None if show_all else 1)}">{"☑" if show_all else "☐"} i obsazené</a>')
-
         slots = current_slots()
         body = render_grid(slots, day, show_later) if view == "grid" else render_list(slots, day, show_later, show_all)
-
         with _lock:
             loading, done, total = STATE["loading"], STATE["done"], STATE["total"]
             upd, dur, errs = STATE["updated"], STATE.get("duration"), list(STATE["errors"])
@@ -951,7 +1040,6 @@ class Server(ThreadingMixIn, HTTPServer):
 
 # ---------------------------------------------------------------- EXPORT (statická PWA pro mobil)
 def _icon_png(path, size):
-    """Jednoduchá ikona aplikace (zelený čtverec se zkratkou)."""
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
@@ -962,10 +1050,9 @@ def _icon_png(path, size):
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", int(size * 0.42))
     except OSError:
         font = ImageFont.load_default()
-    txt = "BB"
-    box = d.textbbox((0, 0), txt, font=font)
+    box = d.textbbox((0, 0), "BB", font=font)
     d.text(((size - (box[2] - box[0])) / 2 - box[0], (size - (box[3] - box[1])) / 2 - box[1]),
-           txt, fill="white", font=font)
+           "BB", fill="white", font=font)
     img.save(path)
     return True
 
@@ -995,7 +1082,6 @@ EXPORT_SW = """
 const C='badminton-v1';
 self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll(['./','index.html','manifest.webmanifest','icon-192.png','icon-512.png'])))});
 self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));
-// vždy nejdřív síť (čerstvá data), bez signálu poslední uložená verze
 self.addEventListener('fetch',e=>{
   e.respondWith(fetch(e.request).then(r=>{const k=r.clone();caches.open(C).then(c=>c.put(e.request,k));return r})
     .catch(()=>caches.match(e.request)));
@@ -1003,8 +1089,6 @@ self.addEventListener('fetch',e=>{
 """
 
 def export_site(out_dir):
-    """Načte všechny haly a uloží statický web (index.html + PWA soubory) do out_dir."""
-    import os
     os.makedirs(out_dir, exist_ok=True)
     collect()
     slots = current_slots()
@@ -1059,19 +1143,27 @@ def _parse_day(arg):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", action="store_true")
-    ap.add_argument("--dump-xarena", nargs="?", const="+1", default=None, help="DD.MM.YYYY nebo +N")
-    ap.add_argument("--dump-viktoria", nargs="?", const="+1", default=None, help="DD.MM.YYYY nebo +N")
-    ap.add_argument("--dump-memberzone", nargs="?", const="+2", default=None, help="DD.MM.YYYY nebo +N")
+    ap.add_argument("--dump-xarena", nargs="?", const="+1", default=None)
+    ap.add_argument("--dump-viktoria", nargs="?", const="+1", default=None)
+    ap.add_argument("--dump-memberzone", nargs="?", const="+2", default=None)
+    ap.add_argument("--dump-sprint", action="store_true")
     ap.add_argument("--cli", action="store_true")
-    ap.add_argument("--export", metavar="SLOZKA", help="uloží statický web (PWA) do složky – pro GitHub Pages")
+    ap.add_argument("--export", metavar="SLOZKA")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="0.0.0.0 = dostupné i z jiných zařízení v síti (mobil na stejné Wi-Fi)")
+    ap.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
     if a.export:
         n, errs = export_site(a.export)
         print(f"Export hotov: {a.export}/index.html ({n} slotů, {len(errs)} chyb)")
         for e in errs: print("CHYBA:", e)
+    elif a.dump_sprint:
+        cfg = SPORTOVISTE[0]
+        pages = SportovisteClient(cfg).fetch_all(dt.date.today() + dt.timedelta(days=cfg["days_ahead"]))
+        for i, h in enumerate(pages):
+            open(f"sprint_dump_{i}.html", "w", encoding="utf-8").write(h)
+            sl = parse_sportoviste(h, dt.datetime(2000, 1, 1))
+            ds = sorted({s["start"][:10] for s in sl})
+            print(f"Týden {i}: {len(sl)} volných 30min bloků, dny {ds[0] if ds else '–'} … {ds[-1] if ds else '–'}")
     elif a.dump_memberzone:
         d = _parse_day(a.dump_memberzone)
         mz = MemberzoneClient()
@@ -1081,17 +1173,11 @@ if __name__ == "__main__":
             print(f"OK – funkční varianta: {mz.variant}")
         except Exception as e:
             print("POZOR:", e)
-        if mz.tried:
-            print("Zkoušené varianty:", "; ".join(mz.tried))
         if mz.last_error_html:
             open("memberzone_error.html", "w", encoding="utf-8").write(mz.last_error_html)
-            print(f"Chybová stránka serveru uložena: memberzone_error.html "
-                  f"({mz.error_title(mz.last_error_html) or 'bez popisu'})")
-        open("memberzone_dump_page.html", "w", encoding="utf-8").write(mz.sport_html or mz.first_html)
         open("memberzone_dump.html", "w", encoding="utf-8").write(html)
         sl = parse_memberzone(html, dt.datetime(2000, 1, 1), d) if html else []
-        print(f"Zobrazený den {mz.shown_date(html) if html else '–'} (chtěl jsem {d:%d.%m.%Y}); "
-              f"bloků: {len(sl)}, volných: {sum(s['free'] for s in sl)}")
+        print(f"Zobrazený den {mz.shown_date(html) if html else '–'}; bloků: {len(sl)}, volných: {sum(s['free'] for s in sl)}")
     elif a.dump_viktoria:
         d = _parse_day(a.dump_viktoria)
         vk = ViktoriaClient()
@@ -1099,10 +1185,8 @@ if __name__ == "__main__":
             html = vk.fetch(d)
         except Exception as e:
             raise SystemExit(f"Chyba: {_short(e)}")
-        open("viktoria_dump_page.html", "w", encoding="utf-8").write(vk.first_html)
         open("viktoria_dump.html", "w", encoding="utf-8").write(html)
-        n = len(parse_viktoria(html, dt.datetime(2000, 1, 1)))
-        print(f"CSRF nalezen: {bool(vk.csrf)}; bloků: {n}; uloženo pro den {d:%d.%m.%Y}")
+        print(f"CSRF nalezen: {bool(vk.csrf)}; bloků: {len(parse_viktoria(html, dt.datetime(2000, 1, 1)))}")
     elif a.dump_xarena:
         d = _parse_day(a.dump_xarena)
         x = XarenaClient()
@@ -1110,11 +1194,9 @@ if __name__ == "__main__":
             _, html = x.fetch(d)
         except RuntimeError as e:
             print("POZOR:", e); html = x.last_html
-        open("xarena_dump_page.html", "w", encoding="utf-8").write(x.first_html)
         open("xarena_dump.html", "w", encoding="utf-8").write(html)
-        print("submit id:", x.submit_id, "| select:", x.select_name)
         n = len(parse_xarena(html, dt.datetime(2000, 1, 1), d)) if html else 0
-        print(f"Rozvrh v odpovědi: {x._has_schedule(html)}, bloků: {n}, datum v textu: {x._mentions(html, d)}")
+        print(f"Rozvrh v odpovědi: {x._has_schedule(html)}, bloků: {n}")
     elif a.dump:
         v = VENUES[0]; rid, (court, slug) = next(iter(v["resources"].items()))
         data = ReenioClient(v, slug).term_list(rid, dt.date.today().isoformat())
@@ -1143,10 +1225,9 @@ if __name__ == "__main__":
             import socket
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
-                ip = s.getsockname()[0]; s.close()
-                print(f"Z mobilu (stejná Wi-Fi): http://{ip}:{srv.server_address[1]}")
+                print(f"Z mobilu (stejná Wi-Fi): http://{s.getsockname()[0]}:{srv.server_address[1]}"); s.close()
             except OSError:
-                print("Z mobilu: http://<IP-adresa-PC>:" + str(srv.server_address[1]))
+                pass
         try:
             srv.serve_forever()
         except KeyboardInterrupt:
