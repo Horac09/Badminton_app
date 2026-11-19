@@ -92,6 +92,17 @@ MEMBERZONE = {
 }
 
 # --- Memberzone Sportoviste.aspx (týdenní přehled volných začátků) – lze přidat další kluby
+# --- Fit4All (obyčejná stránka: /cs/online-rezervace?date=YYYY-MM-DD&activity=6)
+FIT4ALL = {
+    "name": "Fit4All",
+    "maps": "https://maps.app.goo.gl/iT1ABDjMrc2Z9n3B6",
+    "url": "https://www.fit4all.cz/cs/online-rezervace",
+    "activity": "6",              # badminton
+    "days_ahead": 14,
+    "enabled": True,
+    "parallel": 3,
+}
+
 SPORTOVISTE = [
     {
         "name": "Hala Sprint",
@@ -102,7 +113,7 @@ SPORTOVISTE = [
 ]
 
 # pořadí sloupců v mřížce + odkazy na mapy
-_ALL_CFG = VENUES + [XARENA, VIKTORIA, MEMBERZONE] + SPORTOVISTE
+_ALL_CFG = VENUES + [XARENA, VIKTORIA, MEMBERZONE] + SPORTOVISTE + [FIT4ALL]
 VENUE_ORDER = [c["name"] for c in _ALL_CFG]
 VENUE_MAPS = {c["name"]: c.get("maps", "") for c in _ALL_CFG}
 
@@ -506,6 +517,22 @@ class SportovisteClient:
             self.pages.append(html)
         return self.pages
 
+# ---------------------------------------------------------------- ADAPTÉR FIT4ALL
+class Fit4AllClient:
+    """Jeden GET na den. Odkaz na rezervaci = stejná adresa (otevře přímo daný den)."""
+    def __init__(self, cfg=FIT4ALL):
+        self.c = cfg
+        self.s = requests.Session()
+        self.s.headers.update({"user-agent": UA, "accept-language": "cs,en;q=0.9"})
+
+    def day_url(self, date):
+        return f'{self.c["url"]}?date={date.isoformat()}&activity={self.c["activity"]}'
+
+    def fetch(self, date):
+        r = self.s.get(self.day_url(date), timeout=20)
+        r.raise_for_status()
+        return r.text
+
 # ---------------------------------------------------------------- POMOCNÉ
 try:
     from zoneinfo import ZoneInfo
@@ -694,9 +721,42 @@ def parse_sportoviste(html, now=None):
                 t += step
     return out
 
+# ---------------------------------------------------------------- PARSER Fit4All
+_F4_CELL = re.compile(r'<div\b([^>]*class="court-cell[^"]*"[^>]*)>', re.S)
+
+def parse_fit4all(html, now=None):
+    """
+    Každý 30min slot = <div data-name="Badminton KURT 1" data-date="25.11.2026" data-start-time="7:00"
+    class="court-cell court-cell-free|court-cell-booked ...">.
+    """
+    now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
+    out = []
+    for m in _F4_CELL.finditer(html):
+        a = m.group(1)
+        g = lambda k: (re.search(rf'{k}="([^"]*)"', a) or [None, ""])[1]
+        d, t, name, cls = g("data-date"), g("data-start-time"), g("data-name"), g("class")
+        dm, tm = re.match(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", d), re.match(r"(\d{1,2}):(\d{2})", t)
+        if not (dm and tm):
+            continue
+        b0 = dt.datetime(int(dm.group(3)), int(dm.group(2)), int(dm.group(1)), int(tm.group(1)), int(tm.group(2)))
+        if b0 < now:
+            continue
+        court = re.sub(r"(?i)badminton\s+kurt\s*", "Kurt ", name).strip()
+        out.append({"court": court, "start": b0.strftime("%Y-%m-%d %H:%M"),
+                    "end": (b0 + dt.timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M"),
+                    "free": "court-cell-free" in cls, "opens": None, "price": None, "block": 30})
+    return out
+
 # ---------------------------------------------------------------- NAČÍTÁNÍ
 STATE = {"results": {}, "updated": None, "errors": [], "done": 0, "total": 0, "loading": False}
 _lock = threading.Lock()
+
+POST_FORMS = {}          # id -> (url, {pole: hodnota}) – formuláře pro "otevřít přímo daný den"
+
+def _register_form(fid, url, fields):
+    with _lock:
+        POST_FORMS[fid] = (url, fields)
+    return fid
 
 def _days(n_ahead):
     today = dt.date.today()
@@ -736,6 +796,16 @@ def _xarena_task(days):
                     for d, html in pages for t in parse_xarena(html, now, d)]
         return view
     return (f'xarena|{days[0]}', run)
+
+def viktoria_day_link(ds):
+    """Stejná GET adresa, jakou posílá formulář Viktorie (sport + den)."""
+    p = []
+    for i in range(VIKTORIA["sport_count"]):
+        if i == VIKTORIA["sport_index"]:
+            p.append(f"tc%5B{i}%5D.s=true")
+        p.append(f"_tc%5B{i}%5D.s=on")
+    ts = ViktoriaClient._ts(dt.date.fromisoformat(ds))
+    return f'{VIKTORIA["base"]}/timeline/day?{"&".join(p)}&criteriaTimestamp={ts}'
 
 def _viktoria_task(days):
     def run():
@@ -786,6 +856,18 @@ def _sportoviste_task(cfg):
         return view
     return (f'sportoviste|{cfg["name"]}', run)
 
+def _fit4all_task(days):
+    def run():
+        with host_slot("fit4all", FIT4ALL["parallel"]):
+            pages, errs = fetch_days(Fit4AllClient, lambda c, d: (d, c.fetch(d)), days, FIT4ALL["name"])
+        _report(errs)
+        fc = Fit4AllClient()
+        def view(now):
+            return [{**t, "venue": FIT4ALL["name"], "link": fc.day_url(d)}
+                    for d, html in pages for t in parse_fit4all(html, now)]
+        return view
+    return (f'fit4all|{days[0]}', run)
+
 def build_tasks():
     today = dt.date.today()
     tasks = []
@@ -802,6 +884,9 @@ def build_tasks():
         tasks.append(_memberzone_task(ch))
     for cfg in SPORTOVISTE:
         tasks.append(_sportoviste_task(cfg))
+    if FIT4ALL.get("enabled", True):
+        for ch in _chunks(_days(FIT4ALL["days_ahead"]), FIT4ALL["parallel"]):
+            tasks.append(_fit4all_task(ch))
     return tasks
 
 _collect_lock = threading.Lock()
@@ -890,6 +975,24 @@ def _court_key(c):
 def _plural(n):
     return "volný" if n == 1 else ("volné" if 2 <= n <= 4 else "volných")
 
+_USED_FORMS = set()
+
+OPEN_DAY_JS = """<script>
+function openDay(id){var f=document.getElementById('f-'+id);if(!f)return true;f.submit();return false;}
+</script>"""
+
+def forms_html(ids):
+    """Skryté formuláře, které otevřou rezervační web rovnou na daném dni (POST do nového okna)."""
+    out = []
+    with _lock:
+        items = [(i, POST_FORMS[i]) for i in sorted(ids) if i in POST_FORMS]
+    for fid, (url, fields) in items:
+        inputs = "".join(f'<input type=hidden name="{htmlmod.escape(k)}" value="{htmlmod.escape(v)}">'
+                         for k, v in fields.items())
+        out.append(f'<form id="f-{fid}" method=post action="{htmlmod.escape(url)}" target=_blank '
+                   f'accept-charset="utf-8" hidden>{inputs}</form>')
+    return "".join(out)
+
 def _cell_html(lst):
     """Vrací (css třída, vnitřek). Barva podle počtu volných kurtů: l1 / l2 / l3 (3+)."""
     if not lst:
@@ -912,8 +1015,12 @@ def _cell_html(lst):
             meta += f' · {s["price"]} Kč/{s["block"]} min'
         if not s["free"]:
             meta += f' · od {s["opens"]}'
+        onclick = ""
+        if s.get("post"):
+            _USED_FORMS.add(s["post"])
+            onclick = f' onclick="return openDay(\'{s["post"]}\')"'
         items.append(f'<a class="court{"" if s["free"] else " dim"}" href="{htmlmod.escape(s["link"])}" '
-                     f'target=_blank rel=noopener><span class=cn>{htmlmod.escape(s["court"])}</span>'
+                     f'target=_blank rel=noopener{onclick}><span class=cn>{htmlmod.escape(s["court"])}</span>'
                      f'<span class=cm>{meta}</span><span class=go>↗</span></a>')
     return cls, f'<details><summary>{label}</summary><div class=courts>{"".join(items)}</div></details>'
 
@@ -970,7 +1077,10 @@ def render_list(slots, day, show_later, show_all):
         elif s["free"] is None: cls, txt = "st-later", f'od {s["opens"]}'
         else:                   cls, txt = "st-busy", "obsazeno"
         price = f'{s["price"]} Kč / {s.get("block", 30)} min' if s.get("price") else ""
-        rows.append(f'<a class="row" href="{htmlmod.escape(s["link"])}" target=_blank rel=noopener>'
+        oc = ""
+        if s.get("post"):
+            _USED_FORMS.add(s["post"]); oc = f' onclick="return openDay(\'{s["post"]}\')"'
+        rows.append(f'<a class="row" href="{htmlmod.escape(s["link"])}" target=_blank rel=noopener{oc}>'
                     f'<span class=rt>{s["start"][11:]}–{s["end"][11:]}</span>'
                     f'<span class=rv>{htmlmod.escape(s["venue"])}<small>{htmlmod.escape(s["court"])}</small></span>'
                     f'<span class=rp>{price}</span><span class="st {cls}">{txt}</span></a>')
@@ -1144,7 +1254,9 @@ class H(BaseHTTPRequestHandler):
         if view == "list":
             bar.append(f'<a class="{"on" if show_all else ""}" href="{link(all=None if show_all else 1)}">i obsazené</a>')
         slots = current_slots()
+        _USED_FORMS.clear()
         body = render_grid(slots, day, show_later) if view == "grid" else render_list(slots, day, show_later, show_all)
+        body += forms_html(_USED_FORMS) + OPEN_DAY_JS
         with _lock:
             loading, done, total = STATE["loading"], STATE["done"], STATE["total"]
             upd, dur, errs = STATE["updated"], STATE.get("duration"), list(STATE["errors"])
@@ -1225,6 +1337,7 @@ def export_site(out_dir):
     slots = current_slots()
     today = dt.date.today()
     tabs, days = [], []
+    _USED_FORMS.clear()
     for i in range(_max_days()):
         d = today + dt.timedelta(days=i)
         ds = d.isoformat()
@@ -1244,7 +1357,8 @@ def export_site(out_dir):
                    "days": "".join(tabs),
                    "bar": '<div class=bar><a href="#" onclick="toggleLater(this);return false">'
                           'Ukázat i neotevřené rezervace</a></div>',
-                   "body": "".join(days), "errs": _errs_html(errs), "script": EXPORT_JS}
+                   "body": "".join(days) + forms_html(_USED_FORMS), "errs": _errs_html(errs),
+                   "script": EXPORT_JS + OPEN_DAY_JS}
     open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8").write(html)
     json.dump({"name": "Badminton Brno – volné kurty", "short_name": "Badminton",
                "start_url": "./", "display": "standalone", "background_color": "#0f1418",
@@ -1270,6 +1384,7 @@ if __name__ == "__main__":
     ap.add_argument("--dump-viktoria", nargs="?", const="+1", default=None)
     ap.add_argument("--dump-memberzone", nargs="?", const="+2", default=None)
     ap.add_argument("--dump-sprint", action="store_true")
+    ap.add_argument("--dump-fit4all", nargs="?", const="+1", default=None)
     ap.add_argument("--cli", action="store_true")
     ap.add_argument("--export", metavar="SLOZKA")
     ap.add_argument("--port", type=int, default=8765)
@@ -1279,6 +1394,13 @@ if __name__ == "__main__":
         n, errs = export_site(a.export)
         print(f"Export hotov: {a.export}/index.html ({n} slotů, {len(errs)} chyb)")
         for e in errs: print("CHYBA:", e)
+    elif a.dump_fit4all:
+        d = _parse_day(a.dump_fit4all)
+        fc = Fit4AllClient()
+        html = fc.fetch(d)
+        open("fit4all_dump.html", "w", encoding="utf-8").write(html)
+        sl = parse_fit4all(html, dt.datetime(2000, 1, 1))
+        print(f"Staženo {fc.day_url(d)}: bloků {len(sl)}, volných {sum(s['free'] for s in sl)}")
     elif a.dump_sprint:
         cfg = SPORTOVISTE[0]
         pages = SportovisteClient(cfg).fetch_all(dt.date.today() + dt.timedelta(days=cfg["days_ahead"]))
