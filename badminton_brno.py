@@ -1134,7 +1134,8 @@ h1{font-size:20px;margin:0;font-weight:700;letter-spacing:-.01em;flex:1}
 .legend{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px;margin-top:8px;flex-wrap:wrap}
 .legend i{display:inline-block;width:14px;height:14px;border-radius:4px;vertical-align:-2px;margin-right:4px}
 main{padding:12px 16px 40px}
-.gridwrap{overflow-x:auto;border-radius:16px;background:var(--card);box-shadow:var(--shadow)}
+.gridwrap{overflow:auto;border-radius:16px;background:var(--card);box-shadow:var(--shadow);max-height:calc(100vh - var(--hh,220px) - 28px);max-height:calc(100dvh - var(--hh,220px) - 28px);overscroll-behavior:contain}
+table.grid th.tcol{position:sticky;left:0;top:0;z-index:4}
 table.grid{border-collapse:separate;border-spacing:0;width:100%;min-width:640px}
 table.grid th{position:sticky;top:0;background:var(--card);z-index:2;padding:12px 6px 8px;font-size:13px;font-weight:600;
   text-align:left;border-bottom:1px solid var(--line)}
@@ -1198,7 +1199,9 @@ if(t!=='system')document.documentElement.dataset.theme=t;})();
 function setTheme(t){localStorage.setItem('theme',t);
  if(t==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=t;
  document.querySelectorAll('.theme button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));}
-document.addEventListener('DOMContentLoaded',()=>setTheme(localStorage.getItem('theme')||'system'));</script>
+document.addEventListener('DOMContentLoaded',()=>setTheme(localStorage.getItem('theme')||'system'));
+function setHH(){var h=document.querySelector('header');if(h)document.documentElement.style.setProperty('--hh',h.offsetHeight+'px');}
+addEventListener('DOMContentLoaded',setHH);addEventListener('resize',setHH);addEventListener('load',setHH);</script>
 <header>
   <div class=top><h1>🏸 Volné kurty · Brno</h1><span class=upd>%(status)s</span>%(button)s
   <span class=theme><button data-t=light onclick="setTheme('light')">☀ Světlý</button><button data-t=dark onclick="setTheme('dark')">☾ Tmavý</button><button data-t=system class=on onclick="setTheme('system')">Systém</button></span></div>
