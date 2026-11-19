@@ -22,6 +22,7 @@ JAK PŘIDAT DALŠÍ HALU / KURTY (viz KONFIGURACE níže):
   * Reenio (jako TJ Tesla)        -> přidat kurt do VENUES[..]["resources"] nebo novou položku do VENUES
   * Memberzone Sportoviste.aspx   -> přidat položku do SPORTOVISTE (stačí URL stránky sportoviště)
   * jiný rezervační systém        -> potřeba nový adaptér (pošlete cURL)
+  * u každé haly lze vyplnit "maps" = odkaz na Google Mapy (zobrazí se 📍 v záhlaví)
 """
 import argparse, json, os, re, threading, time, html as htmlmod, datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,11 +39,14 @@ PER_HOST = 3              # výchozí max. souběžných spojení na jeden web
 RETRIES = 3               # kolikrát zkusit den znovu při výpadku spojení
 MAX_FAILS_IN_ROW = 3      # po tolika neúspěšných dnech za sebou web v tomto kole vzdáme
 GRID_STEP_MIN = 30        # řádek mřížky = 30 min
+GRID_DAY_FROM = "07:00"   # mřížka vždy ukáže aspoň tento rozsah (i bez volných termínů)
+GRID_DAY_TO = "22:00"
 
 # --- Reenio
 VENUES = [
     {
         "name": "TJ Tesla Brno – Lesná",
+        "maps": "https://maps.app.goo.gl/5XapA5iQAs23Rf2D7",
         "base": "https://tjteslabrno.reenio.cz",
         "section": "/cs/view/lesna-f1/sportovni-hala-f290/badminton-f292",
         # ID kurtu (číslo za "-r" v URL) -> (název, poslední část URL kurtu)
@@ -56,6 +60,7 @@ VENUES = [
 # --- Bizzy / e-rezervace
 XARENA = {
     "name": "Xarena Slatina",
+    "maps": "https://maps.app.goo.gl/ekHmvTmJoYa74KTz5",
     "url": "https://xarena.e-rezervace.cz/Branch/pages/Schedule.faces",
     "service_id": "40106",        # výběr služby badminton
     "days_ahead": 14,
@@ -66,6 +71,7 @@ XARENA = {
 # --- Clubspire timeline
 VIKTORIA = {
     "name": "Centrum Viktoria",
+    "maps": "https://maps.app.goo.gl/JddTpoGSQcCJxsYu8",
     "base": "https://rezervace.centrumviktoria.cz:18443",
     "sport_index": 1,      # tc[1].s=true = badminton
     "sport_count": 5,
@@ -77,7 +83,8 @@ VIKTORIA = {
 
 # --- Memberzone rozpis (Ivanovice)
 MEMBERZONE = {
-    "name": "Ivanovice (Memberzone)",
+    "name": "Ivanovice",
+    "maps": "https://maps.app.goo.gl/wHpfAQUA6p9YnEr79",
     "url": "https://memberzone.cz/ivanovice/",
     "sport_name": "Badminton",
     "days_ahead": 14,
@@ -88,14 +95,16 @@ MEMBERZONE = {
 SPORTOVISTE = [
     {
         "name": "Hala Sprint",
+        "maps": "https://maps.app.goo.gl/NgLHT3WhJdYyYNEb8",
         "url": "https://memberzone.cz/sprint_tenis/Sportoviste.aspx?ID_Sportoviste=3&NAZEV=Badminton+hala",
         "days_ahead": 14,
     },
 ]
 
-# pořadí sloupců v mřížce
-VENUE_ORDER = ([v["name"] for v in VENUES] + [XARENA["name"], VIKTORIA["name"], MEMBERZONE["name"]]
-               + [s["name"] for s in SPORTOVISTE])
+# pořadí sloupců v mřížce + odkazy na mapy
+_ALL_CFG = VENUES + [XARENA, VIKTORIA, MEMBERZONE] + SPORTOVISTE
+VENUE_ORDER = [c["name"] for c in _ALL_CFG]
+VENUE_MAPS = {c["name"]: c.get("maps", "") for c in _ALL_CFG}
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
@@ -254,11 +263,6 @@ class XarenaClient:
     def _has_schedule(html):
         return "scheduleTimeHeader" in html and "horizontalRowHeader" in html
 
-    @staticmethod
-    def _mentions(html, date):
-        pats = [f"{date.day}.{date.month}.{date.year}", f"{date:%d.%m.%Y}", f"{date.day}. {date.month}. {date.year}"]
-        return any(p in html for p in pats)
-
     def _post(self, date, submit_id):
         if not self.view_state:
             self._init_session()
@@ -362,8 +366,6 @@ class MemberzoneClient:
         self.first_html = ""
         self.sport_html = ""
 
-    _inputs = staticmethod(form_fields)
-
     def _post(self, extra):
         f = form_fields(self.html)
         f.update(extra)
@@ -452,10 +454,8 @@ class MemberzoneClient:
 # ---------------------------------------------------------------- ADAPTÉR MEMBERZONE SPORTOVISTE (Hala Sprint)
 class SportovisteClient:
     """
-    Stránka Sportoviste.aspx ukazuje týden. Pro každý volný začátek je na stránce blok skrytých polí:
-      ctlNN$hfDatumCas  = "20. 11. 2026 7:00:00"   (začátek)
-      ctlNN$hfDelka     = "60"                     (délka rezervace v min)
-      ctlNN$hfKurtyName = "Badminton kurt č.3,Badminton kurt č.4"   (volné kurty)
+    Týdenní stránka Sportoviste.aspx. Pro každý volný začátek blok skrytých polí:
+      ctlNN$hfDatumCas = "20. 11. 2026 7:00:00", ctlNN$hfDelka = "60", ctlNN$hfKurtyName = "kurt č.3,kurt č.4"
     Další týden = postback __EVENTTARGET=btnNext.
     """
     def __init__(self, cfg):
@@ -464,9 +464,16 @@ class SportovisteClient:
         self.s.headers.update({"user-agent": UA, "accept-language": "cs,en;q=0.9"})
         self.pages = []
 
-    def _post_next(self, html):
+    @staticmethod
+    def shown_date(html):
+        m = re.search(r'name="myDate"[^>]*value="(\d{4}-\d\d-\d\d)"', html)
+        return dt.date.fromisoformat(m.group(1)) if m else None
+
+    def _post(self, html, target, my_date=None):
         f = form_fields(html)
-        f.update({"__EVENTTARGET": "btnNext", "__EVENTARGUMENT": ""})
+        f.update({"__EVENTTARGET": target, "__EVENTARGUMENT": ""})
+        if my_date:
+            f["myDate"] = my_date.isoformat()
         r = self.s.post(self.c["url"], data=f, timeout=30, headers={
             "origin": "https://memberzone.cz", "referer": self.c["url"],
             "content-type": "application/x-www-form-urlencoded"})
@@ -474,19 +481,28 @@ class SportovisteClient:
         return r.text
 
     def fetch_all(self, until):
-        """Stáhne týdny, dokud nepokryje datum `until` (max. 4 týdny)."""
+        """
+        Stránka ukazuje cca týden od data v poli myDate. Tlačítko btnNext posouvá jen o 1 den,
+        proto skáčeme přímo: nastavíme myDate na první dosud nepokrytý den a pošleme
+        postback 'btnHidePom' (to samé dělá změna data v kalendáři).
+        """
         r = self.s.get(self.c["url"], timeout=30)
         r.raise_for_status()
         html = r.text
         self.pages = [html]
-        for _ in range(4):
-            days = {s["start"][:10] for s in parse_sportoviste(html, dt.datetime(2000, 1, 1))}
-            if not days or max(days) >= until.isoformat():
+        covered = dt.date.today() - dt.timedelta(days=1)
+        for _ in range(8):
+            start = self.shown_date(html) or covered
+            days = [dt.date.fromisoformat(s["start"][:10]) for s in parse_sportoviste(html, dt.datetime(2000, 1, 1))]
+            # stránka pokrývá aspoň do posledního dne s volnem; když je prázdná, posuneme o týden
+            last = max(days) if days else start + dt.timedelta(days=6)
+            covered = max(covered, last, start)
+            if covered >= until:
                 break
-            html = self._post_next(html)
-            new_days = {s["start"][:10] for s in parse_sportoviste(html, dt.datetime(2000, 1, 1))}
-            if not new_days or new_days <= days:
-                break
+            nxt = covered + dt.timedelta(days=1)
+            html = self._post(html, "btnHidePom", nxt)
+            if self.shown_date(html) != nxt:          # skok nefunguje -> záloha po dnech
+                html = self._post(html, "btnNext")
             self.pages.append(html)
         return self.pages
 
@@ -651,16 +667,12 @@ def parse_memberzone(html, now=None, day=None, first_hour=6):
 _SP_FIELD = re.compile(r'<input\b[^>]*name="(ctl\d+)\$(hfDatumCas|hfDelka|hfKurtyName)"[^>]*>', re.I)
 
 def parse_sportoviste(html, now=None):
-    """
-    Z bloků 'volný začátek + délka + volné kurty' vyrobí 30min volné bloky po kurtech.
-    Začátek t s délkou 60 min u kurtu K => K je volný t..t+60.
-    """
     now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
     blocks = {}
     for m in _SP_FIELD.finditer(html):
         v = re.search(r'\bvalue="([^"]*)"', m.group(0))
         blocks.setdefault(m.group(1), {})[m.group(2)] = htmlmod.unescape(v.group(1)) if v else ""
-    free = {}                                    # kurt -> [(od, do)]
+    free = {}
     for b in blocks.values():
         m = re.match(r"\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})\s+(\d{1,2}):(\d{2})", b.get("hfDatumCas", ""))
         if not m:
@@ -858,34 +870,64 @@ def build_grid(slots, day, show_later):
         while t < end:
             cells.setdefault(t.strftime("%H:%M"), {}).setdefault(s["venue"], []).append(s)
             t += step
-    return sorted(cells), cells
+    # celý rozsah dne: od nejdřívějšího do nejpozdějšího času ze všech hal (i obsazené),
+    # aby byly vidět i řádky bez volna. Záloha GRID_DAY_FROM–GRID_DAY_TO.
+    day_slots = [s for s in slots if s["start"].startswith(day)]
+    t0 = min([s["start"][11:] for s in day_slots] + [GRID_DAY_FROM])
+    t1 = max([s["end"][11:] for s in day_slots] + [GRID_DAY_TO])
+    t = dt.datetime.strptime(t0, "%H:%M")
+    t = t.replace(minute=(t.minute // GRID_STEP_MIN) * GRID_STEP_MIN)
+    end = dt.datetime.strptime(t1, "%H:%M")
+    times = set(cells)
+    while t < end:
+        times.add(t.strftime("%H:%M"))
+        t += step
+    return sorted(times), cells
 
 def _court_key(c):
     return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", c)]
 
+def _plural(n):
+    return "volný" if n == 1 else ("volné" if 2 <= n <= 4 else "volných")
+
 def _cell_html(lst):
+    """Vrací (css třída, vnitřek). Barva podle počtu volných kurtů: l1 / l2 / l3 (3+)."""
     if not lst:
-        return "none", "–"
+        return "none", ""
     free_now = [s for s in lst if s["free"] is True]
     later = [s for s in lst if s["free"] is None]
     n = len({s["court"] for s in free_now})
-    label = f"{n} volné" if n else ""
-    if later:
-        label += (" + " if n else "") + f"{len({s['court'] for s in later})} později"
-    cls = "c3" if n >= 3 else ("c2" if n == 2 else ("c1" if n == 1 else "clater"))
+    nl = len({s["court"] for s in later})
+    cls = "l3" if n >= 3 else ("l2" if n == 2 else ("l1" if n == 1 else "later"))
+    if n:
+        label = f'<b>{n}</b><span>{_plural(n)}</span>'
+        if nl:
+            label += f'<em>+{nl} později</em>'
+    else:
+        label = f'<b>{nl}</b><span>později</span>'
     items = []
     for s in sorted(lst, key=lambda s: _court_key(s["court"])):
-        extra = f' · {s["price"]} Kč/{s["block"]} min' if s.get("price") else ""
-        st = "" if s["free"] else f' <i>(rezervace od {s["opens"]})</i>'
-        items.append(f'<li><a href="{htmlmod.escape(s["link"])}" target=_blank>{htmlmod.escape(s["court"])}</a>'
-                     f' <small>{s["start"][11:]}–{s["end"][11:]}{extra}</small>{st}</li>')
-    return cls, f'<details><summary>{label}</summary><ul>{"".join(items)}</ul></details>'
+        meta = f'{s["start"][11:]}–{s["end"][11:]}'
+        if s.get("price"):
+            meta += f' · {s["price"]} Kč/{s["block"]} min'
+        if not s["free"]:
+            meta += f' · od {s["opens"]}'
+        items.append(f'<a class="court{"" if s["free"] else " dim"}" href="{htmlmod.escape(s["link"])}" '
+                     f'target=_blank rel=noopener><span class=cn>{htmlmod.escape(s["court"])}</span>'
+                     f'<span class=cm>{meta}</span><span class=go>↗</span></a>')
+    return cls, f'<details><summary>{label}</summary><div class=courts>{"".join(items)}</div></details>'
+
+def _venue_head(v):
+    maps = VENUE_MAPS.get(v)
+    pin = (f'<a class=pin href="{htmlmod.escape(maps)}" target=_blank rel=noopener title="Otevřít v Google Mapách">'
+           f'📍</a>') if maps else ""
+    return f'<th><div class=vh><span>{htmlmod.escape(v)}</span>{pin}</div></th>'
 
 def render_grid(slots, day, show_later):
     times, cells = build_grid(slots, day, show_later)
     venues = list(VENUE_ORDER)
     if not times:
-        return "<p>V tento den není nic volného.</p>"
+        return "<div class=empty>V tento den není nic volného 😕</div>"
     step = dt.timedelta(minutes=GRID_STEP_MIN)
     nxt = lambda tm: (dt.datetime.strptime(tm, "%H:%M") + step).strftime("%H:%M")
     ident = lambda lst: sorted((s["court"], s["start"], s["end"]) for s in lst)
@@ -902,19 +944,20 @@ def render_grid(slots, day, show_later):
                 span[(tm, v)], span[(t2, v)] = 2, 0
             else:
                 span[(tm, v)] = 1
-    head = "<tr><th class=tcol>Čas</th>" + "".join(f"<th>{htmlmod.escape(v)}</th>" for v in venues) + "</tr>"
+    head = "<tr><th class=tcol></th>" + "".join(_venue_head(v) for v in venues) + "</tr>"
     rows = []
     for tm in times:
-        tds = [f"<td class=tcol>{tm}</td>"]
+        full = tm.endswith(":00")
+        tds = [f'<td class="tcol{" full" if full else ""}">{tm}</td>']
         for v in venues:
             sp = span.get((tm, v), 1)
             if sp == 0:
                 continue
             cls, inner = _cell_html(cells.get(tm, {}).get(v, []))
             rs = " rowspan=2" if sp == 2 else ""
-            hour = " hour" if sp == 2 else ""
-            tds.append(f'<td class="{cls}{hour}"{rs}>{inner}</td>')
-        rows.append("<tr>" + "".join(tds) + "</tr>")
+            inner = f'<div class="blk {cls}{" hr" if sp == 2 else ""}">{inner}</div>' if inner else ""
+            tds.append(f'<td{rs}>{inner}</td>')
+        rows.append(f'<tr data-t="{tm}"{" class=full" if full else ""}>' + "".join(tds) + "</tr>")
     return f"<div class=gridwrap><table class=grid>{head}{''.join(rows)}</table></div>"
 
 def render_list(slots, day, show_later, show_all):
@@ -923,62 +966,150 @@ def render_list(slots, day, show_later, show_all):
         if day and not s["start"].startswith(day): continue
         if s["free"] is False and not show_all: continue
         if s["free"] is None and not (show_later or show_all): continue
-        if s["free"] is True:   cls, txt = "free", "VOLNO"
-        elif s["free"] is None: cls, txt = "later", f'rezervace od {s["opens"]}'
-        else:                   cls, txt = "busy", "obsazeno"
-        d = dt.date.fromisoformat(s["start"][:10])
-        price = f'{s["price"]} Kč / {s.get("block", 30)} min' if s.get("price") else "–"
-        rows.append(f'<tr><td>{DOW[d.weekday()]} {d:%d.%m.}</td>'
-                    f'<td>{s["start"][11:]}–{s["end"][11:]}</td><td>{s["venue"]}</td>'
-                    f'<td>{s["court"]}</td><td class={cls}>{txt}</td><td>{price}</td>'
-                    f'<td><a href="{htmlmod.escape(s["link"])}" target=_blank>Otevřít rezervaci</a></td></tr>')
-    return ("<table class=list><tr><th>Den</th><th>Čas</th><th>Hala</th><th>Kurt</th><th>Stav</th>"
-            "<th>Cena</th><th></th></tr>" + ("".join(rows) or "<tr><td colspan=7>Nic nenalezeno</td></tr>")
-            + "</table>")
+        if s["free"] is True:   cls, txt = "st-free", "volno"
+        elif s["free"] is None: cls, txt = "st-later", f'od {s["opens"]}'
+        else:                   cls, txt = "st-busy", "obsazeno"
+        price = f'{s["price"]} Kč / {s.get("block", 30)} min' if s.get("price") else ""
+        rows.append(f'<a class="row" href="{htmlmod.escape(s["link"])}" target=_blank rel=noopener>'
+                    f'<span class=rt>{s["start"][11:]}–{s["end"][11:]}</span>'
+                    f'<span class=rv>{htmlmod.escape(s["venue"])}<small>{htmlmod.escape(s["court"])}</small></span>'
+                    f'<span class=rp>{price}</span><span class="st {cls}">{txt}</span></a>')
+    return f'<div class=list>{"".join(rows) or "<div class=empty>Nic nenalezeno</div>"}</div>'
 
-# ---------------------------------------------------------------- WEB UI
-PAGE = """<!doctype html><html lang=cs><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">%(refresh)s<title>Badminton Brno</title>
-<style>
-body{font-family:Segoe UI,sans-serif;margin:20px;background:#f5f7fa;color:#222}
-h1{color:#1a5e20;margin-bottom:8px}
-.days a{display:inline-block;padding:6px 10px;margin:2px;border-radius:6px;background:#fff;
-  border:1px solid #ccd;text-decoration:none;color:#222;font-size:14px}
-.days a.sel{background:#1a5e20;color:#fff;border-color:#1a5e20}
-.bar{margin:10px 0}.bar a{margin-right:12px}
-table{border-collapse:collapse;background:#fff;width:100%%}
-td,th{padding:6px 10px;border-bottom:1px solid #e3e3e3;text-align:left;vertical-align:top}
-table.grid th{background:#1a5e20;color:#fff;position:sticky;top:0}
-table.grid td.tcol,table.grid th.tcol{width:60px;font-weight:600}
-table.grid td.none{color:#ccc;text-align:center}
-td.hour{vertical-align:middle;border-left:3px solid #1a5e20}
-td.c1{background:#e8f5e9}td.c2{background:#c8e6c9}td.c3{background:#a5d6a7}td.clater{background:#f1f1f1}
-summary{cursor:pointer;font-weight:600;color:#1a5e20}td.clater summary{color:#777;font-weight:400}
-details ul{margin:6px 0 0 0;padding-left:18px}details li{margin:2px 0}
-.free{color:#1a7f37;font-weight:600}.busy{color:#aaa}.later{color:#888;font-style:italic}
-.err{color:#c00;font-size:12px}.errn{color:#c00;font-weight:600;margin-left:8px}.load{color:#b58900}
-.btn{display:inline-block;margin-left:12px;padding:5px 12px;border-radius:6px;background:#1a5e20;
-  color:#fff;text-decoration:none;font-size:14px}
-.btn:hover{background:#2e7d32}.btn.warn{background:#c62828}.btn.warn:hover{background:#e53935}
-@media (max-width:700px){
-  body{margin:8px;font-size:14px}h1{font-size:20px}
-  .days{display:flex;overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch}
-  .days a{flex:0 0 auto;padding:8px 10px}
-  .bar a{display:inline-block;margin:4px 8px 4px 0}
-  .btn{margin:6px 0 0 0}
-  .gridwrap{overflow-x:auto}
-  td,th{padding:5px 6px}table.grid th{font-size:12px}
-  table.grid td.tcol,table.grid th.tcol{width:44px;position:sticky;left:0;background:#fff;z-index:1}
-  table.grid th.tcol{background:#1a5e20}
-  summary{font-size:13px}
+# ---------------------------------------------------------------- VZHLED (světlý / tmavý podle systému)
+CSS = """
+:root{
+  --bg:#f3f5f7;--card:#ffffff;--text:#18212b;--muted:#6b7785;--line:#e3e8ee;
+  --accent:#16a34a;--accent-ink:#ffffff;
+  --g1:#dcfce7;--g1t:#166534;--g2:#86efac;--g2t:#14532d;--g3:#22c55e;--g3t:#ffffff;
+  --later:#eef1f4;--latert:#6b7785;--err:#dc2626;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
 }
-</style>
-<h1>🏸 Volné badmintonové kurty – Brno</h1>
-<div class=days>%(days)s</div>
-<div class=bar>%(toggles)s</div>
-<p>%(status)s</p>
-%(body)s
-%(errs)s</html>"""
+:root[data-theme=dark]{
+  --bg:#0f1418;--card:#171e24;--text:#e6edf3;--muted:#8b98a5;--line:#26313a;
+  --accent:#22c55e;--accent-ink:#06210f;
+  --g1:#14351f;--g1t:#86efac;--g2:#166534;--g2t:#dcfce7;--g3:#22c55e;--g3t:#052e14;
+  --later:#1e262d;--latert:#8b98a5;--err:#f87171;--shadow:0 1px 2px rgba(0,0,0,.4);
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --bg:#0f1418;--card:#171e24;--text:#e6edf3;--muted:#8b98a5;--line:#26313a;
+  --accent:#22c55e;--accent-ink:#06210f;
+  --g1:#14351f;--g1t:#86efac;--g2:#166534;--g2t:#dcfce7;--g3:#22c55e;--g3t:#052e14;
+  --later:#1e262d;--latert:#8b98a5;--err:#f87171;--shadow:0 1px 2px rgba(0,0,0,.4);
+}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);
+  -webkit-tap-highlight-color:transparent}
+a{color:inherit}
+header{position:sticky;top:0;z-index:5;background:var(--bg);padding:14px 16px 8px;border-bottom:1px solid var(--line)}
+.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+h1{font-size:20px;margin:0;font-weight:700;letter-spacing:-.01em;flex:1}
+.upd{color:var(--muted);font-size:13px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:999px;background:var(--accent);
+  color:var(--accent-ink);text-decoration:none;font-weight:600;font-size:14px;border:0;cursor:pointer}
+.btn.warn{background:var(--err);color:#fff}
+.theme{display:inline-flex;background:var(--card);border-radius:999px;box-shadow:var(--shadow);padding:3px}
+.theme button{border:0;background:none;color:var(--muted);font:inherit;font-size:13px;padding:4px 10px;border-radius:999px;cursor:pointer}
+.theme button.on{background:var(--accent);color:var(--accent-ink);font-weight:600}
+.btn.ghost{background:var(--card);color:var(--text);box-shadow:var(--shadow)}
+.days{display:flex;gap:6px;overflow-x:auto;padding:10px 0 4px;scrollbar-width:none}
+.days::-webkit-scrollbar{display:none}
+.days a{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;min-width:52px;padding:6px 8px;border-radius:12px;
+  background:var(--card);box-shadow:var(--shadow);text-decoration:none;color:var(--text);font-size:12px}
+.days a b{font-size:16px}
+.days a.sel{background:var(--accent);color:var(--accent-ink)}
+.days a.we:not(.sel) b{color:var(--accent)}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.bar a{font-size:13px;padding:5px 12px;border-radius:999px;background:var(--card);box-shadow:var(--shadow);text-decoration:none}
+.bar a.on{background:var(--accent);color:var(--accent-ink)}
+.legend{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px;margin-top:8px;flex-wrap:wrap}
+.legend i{display:inline-block;width:14px;height:14px;border-radius:4px;vertical-align:-2px;margin-right:4px}
+main{padding:12px 16px 40px}
+.gridwrap{overflow-x:auto;border-radius:16px;background:var(--card);box-shadow:var(--shadow)}
+table.grid{border-collapse:separate;border-spacing:0;width:100%;min-width:640px}
+table.grid th{position:sticky;top:0;background:var(--card);z-index:2;padding:12px 6px 8px;font-size:13px;font-weight:600;
+  text-align:left;border-bottom:1px solid var(--line)}
+.vh{display:flex;align-items:center;gap:6px;justify-content:space-between}
+.pin{text-decoration:none;font-size:15px;padding:2px 6px;border-radius:8px;background:var(--later)}
+table.grid td{padding:2px 3px;vertical-align:top}
+tr.full td{border-top:1px solid var(--line)}
+td.tcol{position:sticky;left:0;background:var(--card);z-index:1;width:54px;color:var(--muted);font-size:12px;
+  font-variant-numeric:tabular-nums;padding:6px 8px 0 12px}
+td.tcol.full{color:var(--text);font-weight:600}
+.blk{border-radius:10px;height:100%;min-height:38px;transition:transform .1s}
+.blk.hr{min-height:80px;display:flex;align-items:center}
+.blk.hr details{width:100%}
+.blk.l1{background:var(--g1);color:var(--g1t)}
+.blk.l2{background:var(--g2);color:var(--g2t)}
+.blk.l3{background:var(--g3);color:var(--g3t)}
+.blk.later{background:var(--later);color:var(--latert)}
+summary{list-style:none;cursor:pointer;padding:8px 10px;display:flex;align-items:baseline;gap:5px;flex-wrap:wrap}
+summary::-webkit-details-marker{display:none}
+summary b{font-size:17px;line-height:1}
+summary span{font-size:12px;opacity:.85}
+summary em{font-size:11px;font-style:normal;opacity:.75}
+details[open]{background:var(--card);color:var(--text);border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,.18);
+  position:relative;z-index:3}
+details[open] summary{border-bottom:1px solid var(--line)}
+.courts{display:flex;flex-direction:column;padding:6px}
+.court{display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;text-decoration:none}
+.court:hover{background:var(--later)}
+.court.dim{opacity:.6}
+.cn{font-weight:600;font-size:14px}
+.cm{color:var(--muted);font-size:12px;flex:1}
+.go{color:var(--accent);font-weight:700}
+.list{display:flex;flex-direction:column;gap:6px}
+.row{display:grid;grid-template-columns:96px 1fr auto auto;gap:10px;align-items:center;padding:10px 14px;border-radius:12px;
+  background:var(--card);box-shadow:var(--shadow);text-decoration:none}
+.rt{font-weight:600;font-variant-numeric:tabular-nums}
+.rv small{display:block;color:var(--muted);font-size:12px}
+.rp{color:var(--muted);font-size:12px}
+.st{font-size:12px;padding:3px 10px;border-radius:999px;font-weight:600}
+.st-free{background:var(--g3);color:var(--g3t)}.st-later{background:var(--later);color:var(--latert)}
+.st-busy{background:var(--later);color:var(--muted);text-decoration:line-through}
+.empty{padding:40px;text-align:center;color:var(--muted);background:var(--card);border-radius:16px;box-shadow:var(--shadow)}
+.errs{margin-top:14px;color:var(--err);font-size:12px}
+.errs summary{color:var(--err);padding:4px 0}
+.load{color:#d97706;font-weight:600}
+@media (max-width:700px){
+  header{padding:10px 10px 6px}main{padding:8px 6px 40px}h1{font-size:18px}
+  table.grid th{font-size:11px}td.tcol{width:44px;padding-left:8px}
+  .row{grid-template-columns:80px 1fr auto}.rp{display:none}
+}
+"""
+
+PAGE = """<!doctype html><html lang=cs><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<meta name=color-scheme content="light dark">
+<meta name=theme-color media="(prefers-color-scheme: light)" content="#f3f5f7">
+<meta name=theme-color media="(prefers-color-scheme: dark)" content="#0f1418">
+%(head)s<title>Badminton Brno</title><style>%(css)s</style>
+<script>(function(){var t=localStorage.getItem('theme')||'system';
+if(t!=='system')document.documentElement.dataset.theme=t;})();
+function setTheme(t){localStorage.setItem('theme',t);
+ if(t==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=t;
+ document.querySelectorAll('.theme button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));}
+document.addEventListener('DOMContentLoaded',()=>setTheme(localStorage.getItem('theme')||'system'));</script>
+<header>
+  <div class=top><h1>🏸 Volné kurty · Brno</h1><span class=upd>%(status)s</span>%(button)s
+  <span class=theme><button data-t=light onclick="setTheme('light')">☀ Světlý</button><button data-t=dark onclick="setTheme('dark')">☾ Tmavý</button><button data-t=system class=on onclick="setTheme('system')">Systém</button></span></div>
+  <div class=days>%(days)s</div>
+  %(bar)s
+  <div class=legend><span><i style="background:var(--g1)"></i>1 kurt</span><span><i style="background:var(--g2)"></i>2 kurty</span>
+  <span><i style="background:var(--g3)"></i>3 a více</span><span>📍 = mapa</span></div>
+</header>
+<main>%(body)s%(errs)s</main>
+%(script)s</html>"""
+
+def _day_tab(d, sel, href, extra=""):
+    we = " we" if d.weekday() >= 5 else ""
+    return (f'<a class="{"sel" if sel else ""}{we}" href="{href}" data-d="{d.isoformat()}"{extra}>'
+            f'{DOW[d.weekday()]}<b>{d.day}</b></a>')
+
+def _errs_html(errs):
+    if not errs:
+        return ""
+    return (f'<details class=errs><summary>⚠ {len(errs)} chyb při načítání</summary>'
+            + "".join(f"<div>{htmlmod.escape(e)}</div>" for e in errs) + "</details>")
 
 def _max_days():
     return max([DAYS_AHEAD, XARENA["days_ahead"] + 1, VIKTORIA["days_ahead"] + 1, MEMBERZONE["days_ahead"] + 1]
@@ -1003,35 +1134,30 @@ class H(BaseHTTPRequestHandler):
         if show_later: params["later"] = 1
         if show_all: params["all"] = 1
         link = lambda **kw: "?" + urlencode({k: v for k, v in {**params, **kw}.items() if v is not None})
-        days = []
-        for i in range(_max_days()):
-            d = today + dt.timedelta(days=i)
-            sel = " class=sel" if d.isoformat() == day else ""
-            days.append(f'<a{sel} href="{link(d=d.isoformat())}">{DOW[d.weekday()]} {d:%d.%m.}</a>')
-        toggles = [
-            f'<a href="{link(v="list" if view == "grid" else "grid")}">'
-            f'{"📋 Seznam" if view == "grid" else "▦ Mřížka"}</a>',
-            f'<a href="{link(later=None if show_later else 1)}">'
-            f'{"☑" if show_later else "☐"} i termíny, kde se rezervace teprve otevře</a>',
-        ]
+        days = "".join(_day_tab(today + dt.timedelta(days=i), (today + dt.timedelta(days=i)).isoformat() == day,
+                                link(d=(today + dt.timedelta(days=i)).isoformat()))
+                       for i in range(_max_days()))
+        bar = [f'<a href="{link(v="list" if view == "grid" else "grid")}">'
+               f'{"☰ Seznam" if view == "grid" else "▦ Mřížka"}</a>',
+               f'<a class="{"on" if show_later else ""}" href="{link(later=None if show_later else 1)}">'
+               f'Ukázat i neotevřené rezervace</a>']
         if view == "list":
-            toggles.append(f'<a href="{link(all=None if show_all else 1)}">{"☑" if show_all else "☐"} i obsazené</a>')
+            bar.append(f'<a class="{"on" if show_all else ""}" href="{link(all=None if show_all else 1)}">i obsazené</a>')
         slots = current_slots()
         body = render_grid(slots, day, show_later) if view == "grid" else render_list(slots, day, show_later, show_all)
         with _lock:
             loading, done, total = STATE["loading"], STATE["done"], STATE["total"]
             upd, dur, errs = STATE["updated"], STATE.get("duration"), list(STATE["errors"])
-        qs = urlencode(params)
         if loading:
-            status = f'<span class=load>Načítám… {done}/{total}</span>' + (f' (zobrazena data z {upd})' if upd else '')
+            status = f'<span class=load>Načítám… {done}/{total}</span>'
+            button = ""
         else:
-            status = (f'Aktualizováno: {upd or "–"}' + (f' (načtení trvalo {dur} s)' if dur else '')
-                      + f' <a class="btn{" warn" if errs else ""}" href="/refresh?{qs}">🔄 Obnovit data</a>')
-            if errs:
-                status += f'<span class=errn>⚠ {len(errs)} chyb při načítání – zkuste obnovit</span>'
-        page = PAGE % {"refresh": '<meta http-equiv=refresh content=3>' if loading else "",
-                       "days": "".join(days), "toggles": "".join(toggles), "status": status, "body": body,
-                       "errs": "".join(f"<div class=err>{htmlmod.escape(e)}</div>" for e in errs)}
+            status = f'Aktualizováno {upd or "–"}' + (f' · {dur} s' if dur else "")
+            button = f'<a class="btn{" warn" if errs else ""}" href="/refresh?{urlencode(params)}">🔄 Obnovit</a>'
+        page = PAGE % {"head": '<meta http-equiv=refresh content=3>' if loading else "", "css": CSS,
+                       "status": status, "button": button, "days": days,
+                       "bar": f'<div class=bar>{"".join(bar)}</div>', "body": body,
+                       "errs": _errs_html(errs), "script": ""}
         self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers(); self.wfile.write(page.encode())
 
@@ -1044,7 +1170,7 @@ def _icon_png(path, size):
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         return False
-    img = Image.new("RGB", (size, size), (26, 94, 32))
+    img = Image.new("RGB", (size, size), (22, 163, 74))
     d = ImageDraw.Draw(img)
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", int(size * 0.42))
@@ -1056,32 +1182,37 @@ def _icon_png(path, size):
     img.save(path)
     return True
 
-EXPORT_JS = """
+EXPORT_JS = """<script>
 function show(d){
-  document.querySelectorAll('.day').forEach(e=>e.style.display=e.id==='d'+d?'block':'none');
+  document.querySelectorAll('.day').forEach(e=>e.hidden=e.id!=='d'+d);
   document.querySelectorAll('.days a').forEach(a=>a.classList.toggle('sel',a.dataset.d===d));
   history.replaceState(null,'','#'+d);
 }
+function toggleLater(a){
+  document.body.classList.toggle('showlater');a.classList.toggle('on');
+}
 function hidePast(){
-  const now=new Date(), p=n=>String(n).padStart(2,'0');
+  const now=new Date(),p=n=>String(n).padStart(2,'0');
   const today=now.getFullYear()+'-'+p(now.getMonth()+1)+'-'+p(now.getDate());
   const hm=p(now.getHours())+':'+p(now.getMinutes());
   const el=document.getElementById('d'+today);
-  if(el) el.querySelectorAll('tr[data-t]').forEach(r=>{ if(r.dataset.t<hm) r.style.display='none'; });
+  if(el) el.querySelectorAll('tr[data-t]').forEach(r=>{if(r.dataset.t<hm) r.hidden=true;});
 }
+document.addEventListener('click',e=>{   // otevřený blok zavřít kliknutím jinam
+  document.querySelectorAll('details[open]').forEach(d=>{if(!d.contains(e.target)) d.open=false;});
+});
 document.addEventListener('DOMContentLoaded',()=>{
-  const first=document.querySelector('.days a');
-  const want=location.hash.slice(1);
+  const first=document.querySelector('.days a'),want=location.hash.slice(1);
   show(document.getElementById('d'+want)?want:first.dataset.d);
   hidePast();
   if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 });
-"""
+</script>"""
 
 EXPORT_SW = """
-const C='badminton-v1';
+const C='badminton-v2';
 self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll(['./','index.html','manifest.webmanifest','icon-192.png','icon-512.png'])))});
-self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));
+self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',e=>{
   e.respondWith(fetch(e.request).then(r=>{const k=r.clone();caches.open(C).then(c=>c.put(e.request,k));return r})
     .catch(()=>caches.match(e.request)));
@@ -1093,39 +1224,31 @@ def export_site(out_dir):
     collect()
     slots = current_slots()
     today = dt.date.today()
-    css = re.search(r"<style>(.*?)</style>", PAGE, re.S).group(1).replace("%%", "%")
     tabs, days = [], []
     for i in range(_max_days()):
         d = today + dt.timedelta(days=i)
         ds = d.isoformat()
-        tabs.append(f'<a href="#{ds}" data-d="{ds}" onclick="show(\'{ds}\');return false">{DOW[d.weekday()]} {d:%d.%m.}</a>')
-        grid = render_grid(slots, ds, False)
-        grid = re.sub(r"<tr><td class=tcol>(\d\d:\d\d)</td>", r'<tr data-t="\1"><td class=tcol>\1</td>', grid)
-        days.append(f'<div class=day id="d{ds}" style="display:none">{grid}</div>')
+        tabs.append(_day_tab(d, False, f"#{ds}", f' onclick="show(\'{ds}\');return false"'))
+        # obě varianty (jen volné / i neotevřené) – přepínač je jen CSS
+        days.append(f'<div class=day id="d{ds}" hidden><div class=v-now>{render_grid(slots, ds, False)}</div>'
+                    f'<div class=v-later>{render_grid(slots, ds, True)}</div></div>')
     with _lock:
         upd, errs = STATE["updated"], list(STATE["errors"])
-    err_html = ""
-    if errs:
-        err_html = (f'<details class=err><summary>⚠ {len(errs)} chyb při posledním načtení</summary>'
-                    + "".join(f"<div>{htmlmod.escape(e)}</div>" for e in errs) + "</details>")
-    html = f"""<!doctype html><html lang=cs><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<meta name=theme-color content="#1a5e20">
-<meta name=apple-mobile-web-app-capable content=yes>
-<meta name=apple-mobile-web-app-title content="Badminton">
-<link rel=manifest href="manifest.webmanifest">
-<link rel=apple-touch-icon href="icon-192.png">
-<title>Badminton Brno</title><style>{css}</style>
-<h1>🏸 Volné kurty – Brno</h1>
-<div class=days>{''.join(tabs)}</div>
-<p>Aktualizováno: {upd} <a class=btn href="#" onclick="location.reload();return false">🔄 Načíst znovu</a></p>
-{''.join(days)}
-{err_html}
-<script>{EXPORT_JS}</script></html>"""
+    css = CSS + ".v-later{display:none}.showlater .v-later{display:block}.showlater .v-now{display:none}"
+    head = ('<meta name=apple-mobile-web-app-capable content=yes>'
+            '<meta name=apple-mobile-web-app-status-bar-style content=black-translucent>'
+            '<meta name=apple-mobile-web-app-title content="Badminton">'
+            '<link rel=manifest href="manifest.webmanifest"><link rel=apple-touch-icon href="icon-192.png">')
+    html = PAGE % {"head": head, "css": css, "status": f"Aktualizováno {upd}",
+                   "button": '<a class="btn ghost" href="#" onclick="location.reload();return false">🔄</a>',
+                   "days": "".join(tabs),
+                   "bar": '<div class=bar><a href="#" onclick="toggleLater(this);return false">'
+                          'Ukázat i neotevřené rezervace</a></div>',
+                   "body": "".join(days), "errs": _errs_html(errs), "script": EXPORT_JS}
     open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8").write(html)
     json.dump({"name": "Badminton Brno – volné kurty", "short_name": "Badminton",
-               "start_url": "./", "display": "standalone", "background_color": "#f5f7fa",
-               "theme_color": "#1a5e20",
+               "start_url": "./", "display": "standalone", "background_color": "#0f1418",
+               "theme_color": "#16a34a",
                "icons": [{"src": "icon-192.png", "sizes": "192x192", "type": "image/png"},
                          {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"}]},
               open(os.path.join(out_dir, "manifest.webmanifest"), "w", encoding="utf-8"), ensure_ascii=False)
