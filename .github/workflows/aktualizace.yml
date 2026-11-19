@@ -1,0 +1,36 @@
+name: Aktualizace volných kurtů
+
+on:
+  schedule:
+    - cron: "*/15 5-21 * * *"   # každých 15 min, cca 6:00–23:00 našeho času (cron je v UTC)
+  workflow_dispatch:             # ruční spuštění (tlačítko Run workflow / mobilní aplikace GitHub)
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      TZ: Europe/Prague          # časy a "dnes" podle českého času
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests tzdata pillow
+      - run: python badminton_brno.py --export site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
