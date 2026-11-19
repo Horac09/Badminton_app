@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Badminton Brno - přehled volných kurtů
-  * TJ Tesla Brno – Lesná (Reenio)
+  * TJ Tesla (Reenio)
   * Xarena Slatina (Bizzy / e-rezervace.cz)
   * Centrum Viktoria (Clubspire timeline)
   * Ivanovice (Memberzone – rozpis)
   * Hala Sprint (Memberzone – Sportoviste.aspx)
+  * Fit4All (online-rezervace?date=…&activity=6)
 
 Spuštění:
     pip install requests tzdata
@@ -17,6 +18,7 @@ Spuštění:
     python badminton_brno.py --dump-viktoria 25.11.2026
     python badminton_brno.py --dump-memberzone 01.12.2026
     python badminton_brno.py --dump-sprint
+    python badminton_brno.py --dump-fit4all 25.11.2026
 
 JAK PŘIDAT DALŠÍ HALU / KURTY (viz KONFIGURACE níže):
   * Reenio (jako TJ Tesla)        -> přidat kurt do VENUES[..]["resources"] nebo novou položku do VENUES
@@ -45,7 +47,7 @@ GRID_DAY_TO = "22:00"
 # --- Reenio
 VENUES = [
     {
-        "name": "TJ Tesla Brno – Lesná",
+        "name": "TJ Tesla",
         "maps": "https://maps.app.goo.gl/5XapA5iQAs23Rf2D7",
         "base": "https://tjteslabrno.reenio.cz",
         "section": "/cs/view/lesna-f1/sportovni-hala-f290/badminton-f292",
@@ -92,6 +94,15 @@ MEMBERZONE = {
 }
 
 # --- Memberzone Sportoviste.aspx (týdenní přehled volných začátků) – lze přidat další kluby
+SPORTOVISTE = [
+    {
+        "name": "Hala Sprint",
+        "maps": "https://maps.app.goo.gl/NgLHT3WhJdYyYNEb8",
+        "url": "https://memberzone.cz/sprint_tenis/Sportoviste.aspx?ID_Sportoviste=3&NAZEV=Badminton+hala",
+        "days_ahead": 14,
+    },
+]
+
 # --- Fit4All (obyčejná stránka: /cs/online-rezervace?date=YYYY-MM-DD&activity=6)
 FIT4ALL = {
     "name": "Fit4All",
@@ -102,15 +113,6 @@ FIT4ALL = {
     "enabled": True,
     "parallel": 3,
 }
-
-SPORTOVISTE = [
-    {
-        "name": "Hala Sprint",
-        "maps": "https://maps.app.goo.gl/NgLHT3WhJdYyYNEb8",
-        "url": "https://memberzone.cz/sprint_tenis/Sportoviste.aspx?ID_Sportoviste=3&NAZEV=Badminton+hala",
-        "days_ahead": 14,
-    },
-]
 
 # pořadí sloupců v mřížce + odkazy na mapy
 _ALL_CFG = VENUES + [XARENA, VIKTORIA, MEMBERZONE] + SPORTOVISTE + [FIT4ALL]
@@ -467,7 +469,8 @@ class SportovisteClient:
     """
     Týdenní stránka Sportoviste.aspx. Pro každý volný začátek blok skrytých polí:
       ctlNN$hfDatumCas = "20. 11. 2026 7:00:00", ctlNN$hfDelka = "60", ctlNN$hfKurtyName = "kurt č.3,kurt č.4"
-    Další týden = postback __EVENTTARGET=btnNext.
+    Stránka ukazuje cca týden od data v poli myDate; btnNext posouvá jen o 1 den,
+    proto skáčeme přímo přes myDate + postback btnHidePom (jako výběr data v kalendáři).
     """
     def __init__(self, cfg):
         self.c = cfg
@@ -492,11 +495,6 @@ class SportovisteClient:
         return r.text
 
     def fetch_all(self, until):
-        """
-        Stránka ukazuje cca týden od data v poli myDate. Tlačítko btnNext posouvá jen o 1 den,
-        proto skáčeme přímo: nastavíme myDate na první dosud nepokrytý den a pošleme
-        postback 'btnHidePom' (to samé dělá změna data v kalendáři).
-        """
         r = self.s.get(self.c["url"], timeout=30)
         r.raise_for_status()
         html = r.text
@@ -505,14 +503,13 @@ class SportovisteClient:
         for _ in range(8):
             start = self.shown_date(html) or covered
             days = [dt.date.fromisoformat(s["start"][:10]) for s in parse_sportoviste(html, dt.datetime(2000, 1, 1))]
-            # stránka pokrývá aspoň do posledního dne s volnem; když je prázdná, posuneme o týden
             last = max(days) if days else start + dt.timedelta(days=6)
             covered = max(covered, last, start)
             if covered >= until:
                 break
             nxt = covered + dt.timedelta(days=1)
             html = self._post(html, "btnHidePom", nxt)
-            if self.shown_date(html) != nxt:          # skok nefunguje -> záloha po dnech
+            if self.shown_date(html) != nxt:
                 html = self._post(html, "btnNext")
             self.pages.append(html)
         return self.pages
@@ -751,13 +748,6 @@ def parse_fit4all(html, now=None):
 STATE = {"results": {}, "updated": None, "errors": [], "done": 0, "total": 0, "loading": False}
 _lock = threading.Lock()
 
-POST_FORMS = {}          # id -> (url, {pole: hodnota}) – formuláře pro "otevřít přímo daný den"
-
-def _register_form(fid, url, fields):
-    with _lock:
-        POST_FORMS[fid] = (url, fields)
-    return fid
-
 def _days(n_ahead):
     today = dt.date.today()
     return [today + dt.timedelta(days=i) for i in range(n_ahead + 1)]
@@ -797,16 +787,6 @@ def _xarena_task(days):
         return view
     return (f'xarena|{days[0]}', run)
 
-def viktoria_day_link(ds):
-    """Stejná GET adresa, jakou posílá formulář Viktorie (sport + den)."""
-    p = []
-    for i in range(VIKTORIA["sport_count"]):
-        if i == VIKTORIA["sport_index"]:
-            p.append(f"tc%5B{i}%5D.s=true")
-        p.append(f"_tc%5B{i}%5D.s=on")
-    ts = ViktoriaClient._ts(dt.date.fromisoformat(ds))
-    return f'{VIKTORIA["base"]}/timeline/day?{"&".join(p)}&criteriaTimestamp={ts}'
-
 def _viktoria_task(days):
     def run():
         with host_slot("viktoria", VIKTORIA["parallel"]):
@@ -814,8 +794,7 @@ def _viktoria_task(days):
                                      VIKTORIA["name"], VIKTORIA.get("delay", 0))
         _report(errs)
         def view(now):
-            link = f'{VIKTORIA["base"]}/timeline/day?tabIdx={VIKTORIA["sport_index"]}&resetFilter=true#timelineCalendar'
-            return [{**t, "venue": VIKTORIA["name"], "link": link}
+            return [{**t, "venue": VIKTORIA["name"], "link": VIKTORIA["base"] + "/timeline/day"}
                     for html in pages for t in parse_viktoria(html, now)]
         return view
     return (f'viktoria|{days[0]}', run)
@@ -955,8 +934,7 @@ def build_grid(slots, day, show_later):
         while t < end:
             cells.setdefault(t.strftime("%H:%M"), {}).setdefault(s["venue"], []).append(s)
             t += step
-    # celý rozsah dne: od nejdřívějšího do nejpozdějšího času ze všech hal (i obsazené),
-    # aby byly vidět i řádky bez volna. Záloha GRID_DAY_FROM–GRID_DAY_TO.
+    # celý rozsah dne (i řádky bez volna): od nejdřívějšího do nejpozdějšího času ze všech hal
     day_slots = [s for s in slots if s["start"].startswith(day)]
     t0 = min([s["start"][11:] for s in day_slots] + [GRID_DAY_FROM])
     t1 = max([s["end"][11:] for s in day_slots] + [GRID_DAY_TO])
@@ -972,29 +950,8 @@ def build_grid(slots, day, show_later):
 def _court_key(c):
     return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", c)]
 
-def _plural(n):
-    return "volný" if n == 1 else ("volné" if 2 <= n <= 4 else "volných")
-
-_USED_FORMS = set()
-
-OPEN_DAY_JS = """<script>
-function openDay(id){var f=document.getElementById('f-'+id);if(!f)return true;f.submit();return false;}
-</script>"""
-
-def forms_html(ids):
-    """Skryté formuláře, které otevřou rezervační web rovnou na daném dni (POST do nového okna)."""
-    out = []
-    with _lock:
-        items = [(i, POST_FORMS[i]) for i in sorted(ids) if i in POST_FORMS]
-    for fid, (url, fields) in items:
-        inputs = "".join(f'<input type=hidden name="{htmlmod.escape(k)}" value="{htmlmod.escape(v)}">'
-                         for k, v in fields.items())
-        out.append(f'<form id="f-{fid}" method=post action="{htmlmod.escape(url)}" target=_blank '
-                   f'accept-charset="utf-8" hidden>{inputs}</form>')
-    return "".join(out)
-
-def _cell_html(lst):
-    """Vrací (css třída, vnitřek). Barva podle počtu volných kurtů: l1 / l2 / l3 (3+)."""
+def _cell_html(lst, venue, tm):
+    """Buňka = jen číslo volných kurtů; po klepnutí vyskočí karta s kurty a odkazy."""
     if not lst:
         return "none", ""
     free_now = [s for s in lst if s["free"] is True]
@@ -1002,12 +959,7 @@ def _cell_html(lst):
     n = len({s["court"] for s in free_now})
     nl = len({s["court"] for s in later})
     cls = "l3" if n >= 3 else ("l2" if n == 2 else ("l1" if n == 1 else "later"))
-    if n:
-        label = f'<b>{n}</b><span>{_plural(n)}</span>'
-        if nl:
-            label += f'<em>+{nl} později</em>'
-    else:
-        label = f'<b>{nl}</b><span>později</span>'
+    label = f'<b>{n}</b>' + (f'<em>+{nl}</em>' if n and nl else "") if n else f'<b>{nl}</b>'
     items = []
     for s in sorted(lst, key=lambda s: _court_key(s["court"])):
         meta = f'{s["start"][11:]}–{s["end"][11:]}'
@@ -1015,14 +967,11 @@ def _cell_html(lst):
             meta += f' · {s["price"]} Kč/{s["block"]} min'
         if not s["free"]:
             meta += f' · od {s["opens"]}'
-        onclick = ""
-        if s.get("post"):
-            _USED_FORMS.add(s["post"])
-            onclick = f' onclick="return openDay(\'{s["post"]}\')"'
         items.append(f'<a class="court{"" if s["free"] else " dim"}" href="{htmlmod.escape(s["link"])}" '
-                     f'target=_blank rel=noopener{onclick}><span class=cn>{htmlmod.escape(s["court"])}</span>'
+                     f'target=_blank rel=noopener><span class=cn>{htmlmod.escape(s["court"])}</span>'
                      f'<span class=cm>{meta}</span><span class=go>↗</span></a>')
-    return cls, f'<details><summary>{label}</summary><div class=courts>{"".join(items)}</div></details>'
+    head = f'<div class=ph><b>{htmlmod.escape(venue)}</b><span>{tm}</span></div>'
+    return cls, f'<details><summary>{label}</summary><div class=courts>{head}{"".join(items)}</div></details>'
 
 def _venue_head(v):
     maps = VENUE_MAPS.get(v)
@@ -1060,12 +1009,13 @@ def render_grid(slots, day, show_later):
             sp = span.get((tm, v), 1)
             if sp == 0:
                 continue
-            cls, inner = _cell_html(cells.get(tm, {}).get(v, []))
+            cls, inner = _cell_html(cells.get(tm, {}).get(v, []), v, tm if sp == 1 else f"{tm}–{nxt(nxt(tm))}")
             rs = " rowspan=2" if sp == 2 else ""
             inner = f'<div class="blk {cls}{" hr" if sp == 2 else ""}">{inner}</div>' if inner else ""
             tds.append(f'<td{rs}>{inner}</td>')
         rows.append(f'<tr data-t="{tm}"{" class=full" if full else ""}>' + "".join(tds) + "</tr>")
-    return f"<div class=gridwrap><table class=grid>{head}{''.join(rows)}</table></div>"
+    cols = "<colgroup><col class=ct>" + "<col>" * len(venues) + "</colgroup>"
+    return f"<div class=gridwrap><table class=grid>{cols}{head}{''.join(rows)}</table></div>"
 
 def render_list(slots, day, show_later, show_all):
     rows = []
@@ -1077,16 +1027,19 @@ def render_list(slots, day, show_later, show_all):
         elif s["free"] is None: cls, txt = "st-later", f'od {s["opens"]}'
         else:                   cls, txt = "st-busy", "obsazeno"
         price = f'{s["price"]} Kč / {s.get("block", 30)} min' if s.get("price") else ""
-        oc = ""
-        if s.get("post"):
-            _USED_FORMS.add(s["post"]); oc = f' onclick="return openDay(\'{s["post"]}\')"'
-        rows.append(f'<a class="row" href="{htmlmod.escape(s["link"])}" target=_blank rel=noopener{oc}>'
+        rows.append(f'<a class="row" href="{htmlmod.escape(s["link"])}" target=_blank rel=noopener>'
                     f'<span class=rt>{s["start"][11:]}–{s["end"][11:]}</span>'
                     f'<span class=rv>{htmlmod.escape(s["venue"])}<small>{htmlmod.escape(s["court"])}</small></span>'
                     f'<span class=rp>{price}</span><span class="st {cls}">{txt}</span></a>')
     return f'<div class=list>{"".join(rows) or "<div class=empty>Nic nenalezeno</div>"}</div>'
 
-# ---------------------------------------------------------------- VZHLED (světlý / tmavý podle systému)
+# ---------------------------------------------------------------- VZHLED
+_DARK_VARS = """
+  --bg:#0f1418;--card:#171e24;--text:#e6edf3;--muted:#8b98a5;--line:#26313a;
+  --accent:#22c55e;--accent-ink:#06210f;
+  --g1:#14351f;--g1t:#86efac;--g2:#166534;--g2t:#dcfce7;--g3:#22c55e;--g3t:#052e14;
+  --later:#1e262d;--latert:#8b98a5;--err:#f87171;--shadow:0 1px 2px rgba(0,0,0,.4);
+"""
 CSS = """
 :root{
   --bg:#f3f5f7;--card:#ffffff;--text:#18212b;--muted:#6b7785;--line:#e3e8ee;
@@ -1094,36 +1047,26 @@ CSS = """
   --g1:#dcfce7;--g1t:#166534;--g2:#86efac;--g2t:#14532d;--g3:#22c55e;--g3t:#ffffff;
   --later:#eef1f4;--latert:#6b7785;--err:#dc2626;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
 }
-:root[data-theme=dark]{
-  --bg:#0f1418;--card:#171e24;--text:#e6edf3;--muted:#8b98a5;--line:#26313a;
-  --accent:#22c55e;--accent-ink:#06210f;
-  --g1:#14351f;--g1t:#86efac;--g2:#166534;--g2t:#dcfce7;--g3:#22c55e;--g3t:#052e14;
-  --later:#1e262d;--latert:#8b98a5;--err:#f87171;--shadow:0 1px 2px rgba(0,0,0,.4);
-}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
-  --bg:#0f1418;--card:#171e24;--text:#e6edf3;--muted:#8b98a5;--line:#26313a;
-  --accent:#22c55e;--accent-ink:#06210f;
-  --g1:#14351f;--g1t:#86efac;--g2:#166534;--g2t:#dcfce7;--g3:#22c55e;--g3t:#052e14;
-  --later:#1e262d;--latert:#8b98a5;--err:#f87171;--shadow:0 1px 2px rgba(0,0,0,.4);
-}}
+:root[data-theme=dark]{""" + _DARK_VARS + """}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){""" + _DARK_VARS + """}}
 *{box-sizing:border-box}
 body{margin:0;font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);
   -webkit-tap-highlight-color:transparent}
 a{color:inherit}
 header{position:sticky;top:0;z-index:5;background:var(--bg);padding:14px 16px 8px;border-bottom:1px solid var(--line)}
-.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 h1{font-size:20px;margin:0;font-weight:700;letter-spacing:-.01em;flex:1}
 .upd{color:var(--muted);font-size:13px}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:999px;background:var(--accent);
   color:var(--accent-ink);text-decoration:none;font-weight:600;font-size:14px;border:0;cursor:pointer}
 .btn.warn{background:var(--err);color:#fff}
+.btn.ghost{background:var(--card);color:var(--text);box-shadow:var(--shadow)}
 .theme{display:inline-flex;background:var(--card);border-radius:999px;box-shadow:var(--shadow);padding:3px}
 .theme button{border:0;background:none;color:var(--muted);font:inherit;font-size:13px;padding:4px 10px;border-radius:999px;cursor:pointer}
 .theme button.on{background:var(--accent);color:var(--accent-ink);font-weight:600}
-.btn.ghost{background:var(--card);color:var(--text);box-shadow:var(--shadow)}
 .days{display:flex;gap:6px;overflow-x:auto;padding:10px 0 4px;scrollbar-width:none}
 .days::-webkit-scrollbar{display:none}
-.days a{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;min-width:52px;padding:6px 8px;border-radius:12px;
+.days a{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;min-width:50px;padding:6px 8px;border-radius:12px;
   background:var(--card);box-shadow:var(--shadow);text-decoration:none;color:var(--text);font-size:12px}
 .days a b{font-size:16px}
 .days a.sel{background:var(--accent);color:var(--accent-ink)}
@@ -1133,36 +1076,41 @@ h1{font-size:20px;margin:0;font-weight:700;letter-spacing:-.01em;flex:1}
 .bar a.on{background:var(--accent);color:var(--accent-ink)}
 .legend{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px;margin-top:8px;flex-wrap:wrap}
 .legend i{display:inline-block;width:14px;height:14px;border-radius:4px;vertical-align:-2px;margin-right:4px}
-main{padding:12px 16px 40px}
-.gridwrap{overflow:auto;border-radius:16px;background:var(--card);box-shadow:var(--shadow);max-height:calc(100vh - var(--hh,220px) - 28px);max-height:calc(100dvh - var(--hh,220px) - 28px);overscroll-behavior:contain}
-table.grid th.tcol{position:sticky;left:0;top:0;z-index:4}
-table.grid{border-collapse:separate;border-spacing:0;width:100%;min-width:640px}
-table.grid th{position:sticky;top:0;background:var(--card);z-index:2;padding:12px 6px 8px;font-size:13px;font-weight:600;
-  text-align:left;border-bottom:1px solid var(--line)}
-.vh{display:flex;align-items:center;gap:6px;justify-content:space-between}
-.pin{text-decoration:none;font-size:15px;padding:2px 6px;border-radius:8px;background:var(--later)}
+main{padding:12px 16px 20px}
+.gridwrap{overflow:auto;border-radius:16px;background:var(--card);box-shadow:var(--shadow);
+  max-height:calc(100vh - var(--hh,220px) - 28px);max-height:calc(100dvh - var(--hh,220px) - 28px);overscroll-behavior:contain}
+table.grid{border-collapse:separate;border-spacing:0;width:100%;table-layout:fixed}
+col.ct{width:52px}
+table.grid th{position:sticky;top:0;background:var(--card);z-index:2;padding:10px 3px 8px;font-size:12px;font-weight:600;
+  text-align:center;border-bottom:1px solid var(--line);vertical-align:bottom;line-height:1.2}
+table.grid th.tcol{left:0;z-index:4}
+.vh{display:flex;flex-direction:column;align-items:center;gap:4px}
+.vh span{hyphens:auto;-webkit-hyphens:auto;overflow-wrap:break-word}
+.pin{text-decoration:none;font-size:13px;padding:1px 6px;border-radius:8px;background:var(--later)}
 table.grid td{padding:2px 3px;vertical-align:top}
 tr.full td{border-top:1px solid var(--line)}
-td.tcol{position:sticky;left:0;background:var(--card);z-index:1;width:54px;color:var(--muted);font-size:12px;
-  font-variant-numeric:tabular-nums;padding:6px 8px 0 12px}
+td.tcol{position:sticky;left:0;background:var(--card);z-index:1;color:var(--muted);font-size:12px;
+  font-variant-numeric:tabular-nums;padding:6px 4px 0 10px}
 td.tcol.full{color:var(--text);font-weight:600}
-.blk{border-radius:10px;height:100%;min-height:38px;transition:transform .1s}
-.blk.hr{min-height:80px;display:flex;align-items:center}
+.blk{border-radius:10px;min-height:34px}
+.blk.hr{min-height:72px;display:flex;align-items:center;justify-content:center}
 .blk.hr details{width:100%}
 .blk.l1{background:var(--g1);color:var(--g1t)}
 .blk.l2{background:var(--g2);color:var(--g2t)}
 .blk.l3{background:var(--g3);color:var(--g3t)}
 .blk.later{background:var(--later);color:var(--latert)}
-summary{list-style:none;cursor:pointer;padding:8px 10px;display:flex;align-items:baseline;gap:5px;flex-wrap:wrap}
+summary{list-style:none;cursor:pointer;min-height:34px;display:flex;align-items:center;justify-content:center;gap:2px}
 summary::-webkit-details-marker{display:none}
 summary b{font-size:17px;line-height:1}
-summary span{font-size:12px;opacity:.85}
-summary em{font-size:11px;font-style:normal;opacity:.75}
-details[open]{background:var(--card);color:var(--text);border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,.18);
-  position:relative;z-index:3}
-details[open] summary{border-bottom:1px solid var(--line)}
-.courts{display:flex;flex-direction:column;padding:6px}
-.court{display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;text-decoration:none}
+summary em{font-size:10px;font-style:normal;opacity:.75}
+details[open] summary{outline:2px solid var(--accent);outline-offset:-2px;border-radius:10px}
+.courts{display:none}
+details[open] .courts{display:flex;flex-direction:column;position:fixed;z-index:50;left:50%;top:50%;
+  transform:translate(-50%,-50%);width:min(340px,92vw);max-height:70vh;overflow:auto;padding:6px;
+  background:var(--card);color:var(--text);border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.ph{display:flex;justify-content:space-between;align-items:baseline;padding:8px 10px 10px;border-bottom:1px solid var(--line);margin-bottom:4px}
+.ph span{color:var(--muted);font-size:13px}
+.court{display:flex;align-items:center;gap:8px;padding:10px;border-radius:10px;text-decoration:none}
 .court:hover{background:var(--later)}
 .court.dim{opacity:.6}
 .cn{font-weight:600;font-size:14px}
@@ -1179,14 +1127,31 @@ details[open] summary{border-bottom:1px solid var(--line)}
 .st-busy{background:var(--later);color:var(--muted);text-decoration:line-through}
 .empty{padding:40px;text-align:center;color:var(--muted);background:var(--card);border-radius:16px;box-shadow:var(--shadow)}
 .errs{margin-top:14px;color:var(--err);font-size:12px}
-.errs summary{color:var(--err);padding:4px 0}
+.errs summary{color:var(--err);padding:4px 0;justify-content:flex-start}
 .load{color:#d97706;font-weight:600}
 @media (max-width:700px){
-  header{padding:10px 10px 6px}main{padding:8px 6px 40px}h1{font-size:18px}
-  table.grid th{font-size:11px}td.tcol{width:44px;padding-left:8px}
+  header{padding:10px 10px 6px}main{padding:8px 6px 12px}h1{font-size:18px}
+  table.grid th{font-size:10px;padding:8px 1px 6px;letter-spacing:-.02em}col.ct{width:42px}td.tcol{padding-left:6px;font-size:11px}
+  table.grid td{padding:2px 1px}summary b{font-size:15px}
   .row{grid-template-columns:80px 1fr auto}.rp{display:none}
 }
 """
+
+THEME_JS = """<script>
+(function(){var t=localStorage.getItem('theme')||'system';if(t!=='system')document.documentElement.dataset.theme=t;})();
+function setTheme(t){localStorage.setItem('theme',t);
+ if(t==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=t;
+ document.querySelectorAll('.theme button').forEach(function(b){b.classList.toggle('on',b.dataset.t===t);});}
+function setHH(){var h=document.querySelector('header');if(h)document.documentElement.style.setProperty('--hh',h.offsetHeight+'px');}
+document.addEventListener('DOMContentLoaded',function(){setTheme(localStorage.getItem('theme')||'system');setHH();});
+addEventListener('resize',setHH);addEventListener('load',setHH);
+document.addEventListener('click',function(e){
+  document.querySelectorAll('details[open]').forEach(function(d){
+    if(!d.contains(e.target)) d.open=false;});});
+document.addEventListener('toggle',function(e){
+  if(e.target.open) document.querySelectorAll('details[open]').forEach(function(d){if(d!==e.target)d.open=false;});
+},true);
+</script>"""
 
 PAGE = """<!doctype html><html lang=cs><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -1194,21 +1159,14 @@ PAGE = """<!doctype html><html lang=cs><meta charset=utf-8>
 <meta name=theme-color media="(prefers-color-scheme: light)" content="#f3f5f7">
 <meta name=theme-color media="(prefers-color-scheme: dark)" content="#0f1418">
 %(head)s<title>Badminton Brno</title><style>%(css)s</style>
-<script>(function(){var t=localStorage.getItem('theme')||'system';
-if(t!=='system')document.documentElement.dataset.theme=t;})();
-function setTheme(t){localStorage.setItem('theme',t);
- if(t==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=t;
- document.querySelectorAll('.theme button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));}
-document.addEventListener('DOMContentLoaded',()=>setTheme(localStorage.getItem('theme')||'system'));
-function setHH(){var h=document.querySelector('header');if(h)document.documentElement.style.setProperty('--hh',h.offsetHeight+'px');}
-addEventListener('DOMContentLoaded',setHH);addEventListener('resize',setHH);addEventListener('load',setHH);</script>
+%(theme)s
 <header>
   <div class=top><h1>🏸 Volné kurty · Brno</h1><span class=upd>%(status)s</span>%(button)s
   <span class=theme><button data-t=light onclick="setTheme('light')">☀ Světlý</button><button data-t=dark onclick="setTheme('dark')">☾ Tmavý</button><button data-t=system class=on onclick="setTheme('system')">Systém</button></span></div>
   <div class=days>%(days)s</div>
   %(bar)s
   <div class=legend><span><i style="background:var(--g1)"></i>1 kurt</span><span><i style="background:var(--g2)"></i>2 kurty</span>
-  <span><i style="background:var(--g3)"></i>3 a více</span><span>📍 = mapa</span></div>
+  <span><i style="background:var(--g3)"></i>3 a více</span><span>číslo = počet volných kurtů · 📍 mapa</span></div>
 </header>
 <main>%(body)s%(errs)s</main>
 %(script)s</html>"""
@@ -1225,8 +1183,8 @@ def _errs_html(errs):
             + "".join(f"<div>{htmlmod.escape(e)}</div>" for e in errs) + "</details>")
 
 def _max_days():
-    return max([DAYS_AHEAD, XARENA["days_ahead"] + 1, VIKTORIA["days_ahead"] + 1, MEMBERZONE["days_ahead"] + 1]
-               + [s.get("days_ahead", DAYS_AHEAD) + 1 for s in SPORTOVISTE])
+    return max([DAYS_AHEAD, XARENA["days_ahead"] + 1, VIKTORIA["days_ahead"] + 1, MEMBERZONE["days_ahead"] + 1,
+                FIT4ALL["days_ahead"] + 1] + [s.get("days_ahead", DAYS_AHEAD) + 1 for s in SPORTOVISTE])
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -1257,9 +1215,7 @@ class H(BaseHTTPRequestHandler):
         if view == "list":
             bar.append(f'<a class="{"on" if show_all else ""}" href="{link(all=None if show_all else 1)}">i obsazené</a>')
         slots = current_slots()
-        _USED_FORMS.clear()
         body = render_grid(slots, day, show_later) if view == "grid" else render_list(slots, day, show_later, show_all)
-        body += forms_html(_USED_FORMS) + OPEN_DAY_JS
         with _lock:
             loading, done, total = STATE["loading"], STATE["done"], STATE["total"]
             upd, dur, errs = STATE["updated"], STATE.get("duration"), list(STATE["errors"])
@@ -1270,7 +1226,7 @@ class H(BaseHTTPRequestHandler):
             status = f'Aktualizováno {upd or "–"}' + (f' · {dur} s' if dur else "")
             button = f'<a class="btn{" warn" if errs else ""}" href="/refresh?{urlencode(params)}">🔄 Obnovit</a>'
         page = PAGE % {"head": '<meta http-equiv=refresh content=3>' if loading else "", "css": CSS,
-                       "status": status, "button": button, "days": days,
+                       "theme": THEME_JS, "status": status, "button": button, "days": days,
                        "bar": f'<div class=bar>{"".join(bar)}</div>', "body": body,
                        "errs": _errs_html(errs), "script": ""}
         self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1299,25 +1255,20 @@ def _icon_png(path, size):
 
 EXPORT_JS = """<script>
 function show(d){
-  document.querySelectorAll('.day').forEach(e=>e.hidden=e.id!=='d'+d);
-  document.querySelectorAll('.days a').forEach(a=>a.classList.toggle('sel',a.dataset.d===d));
+  document.querySelectorAll('.day').forEach(function(e){e.hidden=e.id!=='d'+d;});
+  document.querySelectorAll('.days a').forEach(function(a){a.classList.toggle('sel',a.dataset.d===d);});
   history.replaceState(null,'','#'+d);
 }
-function toggleLater(a){
-  document.body.classList.toggle('showlater');a.classList.toggle('on');
-}
+function toggleLater(a){document.body.classList.toggle('showlater');a.classList.toggle('on');}
 function hidePast(){
-  const now=new Date(),p=n=>String(n).padStart(2,'0');
-  const today=now.getFullYear()+'-'+p(now.getMonth()+1)+'-'+p(now.getDate());
-  const hm=p(now.getHours())+':'+p(now.getMinutes());
-  const el=document.getElementById('d'+today);
-  if(el) el.querySelectorAll('tr[data-t]').forEach(r=>{if(r.dataset.t<hm) r.hidden=true;});
+  var now=new Date(),p=function(n){return String(n).padStart(2,'0');};
+  var today=now.getFullYear()+'-'+p(now.getMonth()+1)+'-'+p(now.getDate());
+  var hm=p(now.getHours())+':'+p(now.getMinutes());
+  var el=document.getElementById('d'+today);
+  if(el) el.querySelectorAll('tr[data-t]').forEach(function(r){if(r.dataset.t<hm) r.hidden=true;});
 }
-document.addEventListener('click',e=>{   // otevřený blok zavřít kliknutím jinam
-  document.querySelectorAll('details[open]').forEach(d=>{if(!d.contains(e.target)) d.open=false;});
-});
-document.addEventListener('DOMContentLoaded',()=>{
-  const first=document.querySelector('.days a'),want=location.hash.slice(1);
+document.addEventListener('DOMContentLoaded',function(){
+  var first=document.querySelector('.days a'),want=location.hash.slice(1);
   show(document.getElementById('d'+want)?want:first.dataset.d);
   hidePast();
   if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
@@ -1325,7 +1276,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 </script>"""
 
 EXPORT_SW = """
-const C='badminton-v2';
+const C='badminton-v3';
 self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll(['./','index.html','manifest.webmanifest','icon-192.png','icon-512.png'])))});
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',e=>{
@@ -1340,12 +1291,10 @@ def export_site(out_dir):
     slots = current_slots()
     today = dt.date.today()
     tabs, days = [], []
-    _USED_FORMS.clear()
     for i in range(_max_days()):
         d = today + dt.timedelta(days=i)
         ds = d.isoformat()
         tabs.append(_day_tab(d, False, f"#{ds}", f' onclick="show(\'{ds}\');return false"'))
-        # obě varianty (jen volné / i neotevřené) – přepínač je jen CSS
         days.append(f'<div class=day id="d{ds}" hidden><div class=v-now>{render_grid(slots, ds, False)}</div>'
                     f'<div class=v-later>{render_grid(slots, ds, True)}</div></div>')
     with _lock:
@@ -1355,13 +1304,12 @@ def export_site(out_dir):
             '<meta name=apple-mobile-web-app-status-bar-style content=black-translucent>'
             '<meta name=apple-mobile-web-app-title content="Badminton">'
             '<link rel=manifest href="manifest.webmanifest"><link rel=apple-touch-icon href="icon-192.png">')
-    html = PAGE % {"head": head, "css": css, "status": f"Aktualizováno {upd}",
+    html = PAGE % {"head": head, "css": css, "theme": THEME_JS, "status": f"Aktualizováno {upd}",
                    "button": '<a class="btn ghost" href="#" onclick="location.reload();return false">🔄</a>',
                    "days": "".join(tabs),
                    "bar": '<div class=bar><a href="#" onclick="toggleLater(this);return false">'
                           'Ukázat i neotevřené rezervace</a></div>',
-                   "body": "".join(days) + forms_html(_USED_FORMS), "errs": _errs_html(errs),
-                   "script": EXPORT_JS + OPEN_DAY_JS}
+                   "body": "".join(days), "errs": _errs_html(errs), "script": EXPORT_JS}
     open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8").write(html)
     json.dump({"name": "Badminton Brno – volné kurty", "short_name": "Badminton",
                "start_url": "./", "display": "standalone", "background_color": "#0f1418",
@@ -1403,7 +1351,7 @@ if __name__ == "__main__":
         html = fc.fetch(d)
         open("fit4all_dump.html", "w", encoding="utf-8").write(html)
         sl = parse_fit4all(html, dt.datetime(2000, 1, 1))
-        print(f"Staženo {fc.day_url(d)}: bloků {len(sl)}, volných {sum(s['free'] for s in sl)}")
+        print(f"Staženo {fc.day_url(d)}; bloků: {len(sl)}, volných: {sum(s['free'] for s in sl)}")
     elif a.dump_sprint:
         cfg = SPORTOVISTE[0]
         pages = SportovisteClient(cfg).fetch_all(dt.date.today() + dt.timedelta(days=cfg["days_ahead"]))
@@ -1411,7 +1359,7 @@ if __name__ == "__main__":
             open(f"sprint_dump_{i}.html", "w", encoding="utf-8").write(h)
             sl = parse_sportoviste(h, dt.datetime(2000, 1, 1))
             ds = sorted({s["start"][:10] for s in sl})
-            print(f"Týden {i}: {len(sl)} volných 30min bloků, dny {ds[0] if ds else '–'} … {ds[-1] if ds else '–'}")
+            print(f"Stránka {i}: {len(sl)} volných 30min bloků, dny {ds[0] if ds else '–'} … {ds[-1] if ds else '–'}")
     elif a.dump_memberzone:
         d = _parse_day(a.dump_memberzone)
         mz = MemberzoneClient()
