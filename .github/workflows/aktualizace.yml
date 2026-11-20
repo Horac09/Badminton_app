@@ -2,8 +2,8 @@ name: Aktualizace volných kurtů
 
 on:
   schedule:
-    - cron: "*/15 5-21 * * *"   # každých 15 min, cca 6:00–23:00 našeho času (cron je v UTC)
-  workflow_dispatch:             # ruční spuštění (Run workflow)
+    - cron: "7,22,37,52 5-21 * * *"   # záloha; hlavní spouštění je z cron-job.org
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -23,14 +23,26 @@ jobs:
     env:
       TZ: Europe/Prague
     steps:
-      - uses: actions/checkout@v5          # Node 24
-      - uses: actions/setup-python@v6      # Node 24
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install requests tzdata pillow
       - run: python badminton_brno.py --export site
+      - name: Ikona aplikace (icon.png z repozitáře)
+        run: |
+          if [ -f icon.png ]; then
+            python -c "
+          from PIL import Image
+          im = Image.open('icon.png').convert('RGB')
+          for s in (192, 512):
+              im.resize((s, s), Image.LANCZOS).save(f'site/icon-{s}.png')
+          im.resize((48, 48), Image.LANCZOS).save('site/favicon.png')
+          "
+            sed -i 's|<title>|<link rel=icon type=image/png href="favicon.png"><title>|' site/index.html
+          fi
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
       - id: deployment
-        uses: actions/deploy-pages@v5      # Node 24
+        uses: actions/deploy-pages@v5
