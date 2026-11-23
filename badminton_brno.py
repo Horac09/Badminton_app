@@ -1302,8 +1302,44 @@ class H(BaseHTTPRequestHandler):
 
 class Server(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    # Windows: s SO_REUSEADDR by nový server "sdílel" port se starým, ještě běžícím
+    # procesem a prohlížeč by dál dostával starou verzi. Proto port obsadit výhradně.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        import socket
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 # ---------------------------------------------------------------- EXPORT (statická PWA pro mobil)
+def make_icons(out_dir, src_path="icon.png"):
+    """
+    Ikony aplikace z icon.png (pokud je vedle skriptu):
+      icon-192/512.png          – běžné (purpose "any")
+      icon-maskable-192/512.png – pro Android/MIUI: symbol zmenšený do bezpečné zóny,
+                                  pozadí až do krajů -> launcher ji ořízne do svého tvaru bez černých rohů
+      favicon.png               – záložka prohlížeče
+    Vrací True, pokud se použil icon.png.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    if not os.path.exists(src_path):
+        return False
+    src = Image.open(src_path).convert("RGB")
+    bg = src.getpixel((2, 2))                       # barva pozadí z rohu obrázku
+    for s in (192, 512):
+        src.resize((s, s), Image.LANCZOS).save(os.path.join(out_dir, f"icon-{s}.png"))
+        canvas = Image.new("RGB", (s, s), bg)
+        inner = int(s * 0.72)                       # bezpečná zóna maskable ikony = 80 % (kruh)
+        off = (s - inner) // 2
+        canvas.paste(src.resize((inner, inner), Image.LANCZOS), (off, off))
+        canvas.save(os.path.join(out_dir, f"icon-maskable-{s}.png"))
+    src.resize((48, 48), Image.LANCZOS).save(os.path.join(out_dir, "favicon.png"))
+    return True
+
 def _icon_png(path, size):
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -1344,8 +1380,8 @@ document.addEventListener('DOMContentLoaded',function(){
 </script>"""
 
 EXPORT_SW = """
-const C='badminton-v4';
-self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll(['./','index.html','manifest.webmanifest','icon-192.png','icon-512.png'])))});
+const C='badminton-v5';
+self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll(['./','index.html','manifest.webmanifest','icon-192.png','icon-512.png','icon-maskable-192.png','icon-maskable-512.png'])))});
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',e=>{
   e.respondWith(fetch(e.request).then(r=>{const k=r.clone();caches.open(C).then(c=>c.put(e.request,k));return r})
@@ -1371,7 +1407,8 @@ def export_site(out_dir):
     head = ('<meta name=apple-mobile-web-app-capable content=yes>'
             '<meta name=apple-mobile-web-app-status-bar-style content=black-translucent>'
             '<meta name=apple-mobile-web-app-title content="Badminton">'
-            '<link rel=manifest href="manifest.webmanifest"><link rel=apple-touch-icon href="icon-192.png">')
+            '<link rel=manifest href="manifest.webmanifest"><link rel=apple-touch-icon href="icon-maskable-192.png">'
+            '<link rel=icon type=image/png href="favicon.png">')
     html = PAGE % {"head": head, "css": css, "theme": THEME_JS, "status": f"Aktualizováno {upd}",
                    "button": '<a class="btn ghost" href="#" onclick="location.reload();return false">🔄</a>',
                    "days": "".join(tabs),
@@ -1379,15 +1416,20 @@ def export_site(out_dir):
                           'Ukázat i neotevřené rezervace</a></div>',
                    "body": "".join(days), "errs": _errs_html(errs), "script": EXPORT_JS}
     open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8").write(html)
-    json.dump({"name": "Badminton Brno – volné kurty", "short_name": "Badminton",
-               "start_url": "./", "display": "standalone", "background_color": "#0f1418",
-               "theme_color": "#16a34a",
-               "icons": [{"src": "icon-192.png", "sizes": "192x192", "type": "image/png"},
-                         {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"}]},
+    custom = make_icons(out_dir)
+    if not custom:
+        for s in (192, 512):
+            _icon_png(os.path.join(out_dir, f"icon-{s}.png"), s)
+            _icon_png(os.path.join(out_dir, f"icon-maskable-{s}.png"), s)
+    json.dump({"id": "./", "name": "Badminton Brno – volné kurty", "short_name": "Badminton",
+               "start_url": "./", "scope": "./", "display": "standalone",
+               "background_color": "#16a34a", "theme_color": "#16a34a",
+               "icons": [{"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                         {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+                         {"src": "icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"},
+                         {"src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}]},
               open(os.path.join(out_dir, "manifest.webmanifest"), "w", encoding="utf-8"), ensure_ascii=False)
     open(os.path.join(out_dir, "sw.js"), "w", encoding="utf-8").write(EXPORT_SW)
-    for s in (192, 512):
-        _icon_png(os.path.join(out_dir, f"icon-{s}.png"), s)
     open(os.path.join(out_dir, ".nojekyll"), "w").close()
     return len(slots), errs
 
@@ -1499,7 +1541,8 @@ if __name__ == "__main__":
             try:
                 srv = Server((a.host, port), H); break
             except OSError as ex:
-                print(f"Port {port} nelze použít ({ex.__class__.__name__}), zkouším další…")
+                print(f"Port {port} je obsazený ({ex.__class__.__name__}) – nejspíš běží starší verze, "
+                      f"zkouším další port…")
         if srv is None:
             raise SystemExit("Nepodařilo se otevřít žádný port.")
         threading.Thread(target=refresher, daemon=True).start()
