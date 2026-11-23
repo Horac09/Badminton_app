@@ -520,7 +520,13 @@ class Fit4AllClient:
     def __init__(self, cfg=FIT4ALL):
         self.c = cfg
         self.s = requests.Session()
-        self.s.headers.update({"user-agent": UA, "accept-language": "cs,en;q=0.9"})
+        self.s.headers.update({
+            "user-agent": UA,
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": "cs-CZ,cs;q=0.9,en;q=0.8",
+            "referer": "https://www.fit4all.cz/cs/online-rezervace",
+        })
+        self.s.cookies.set("cookie_consent_user_accepted", "true", domain="www.fit4all.cz")
 
     def day_url(self, date):
         return f'{self.c["url"]}?date={date.isoformat()}&activity={self.c["activity"]}'
@@ -528,6 +534,10 @@ class Fit4AllClient:
     def fetch(self, date):
         r = self.s.get(self.day_url(date), timeout=20)
         r.raise_for_status()
+        if "court-cell" not in r.text:
+            title = re.search(r"<title>\s*(.*?)\s*</title>", r.text, re.S | re.I)
+            raise RuntimeError(f"stránka bez rozvrhu (HTTP {r.status_code}, {len(r.text)} znaků, "
+                               f"titulek: {title.group(1)[:80] if title else '–'}, adresa: {r.url})")
         return r.text
 
 # ---------------------------------------------------------------- POMOCNÉ
