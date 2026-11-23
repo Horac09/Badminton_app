@@ -3,7 +3,7 @@
 Badminton Brno - přehled volných kurtů
   * TJ Tesla (Reenio)
   * Xarena Slatina (Bizzy / e-rezervace.cz)
-  * Centrum Viktoria (Clubspire timeline)
+  * Centrum Viktoria, Kuklenská (Clubspire timeline)
   * Ivanovice (Memberzone – rozpis)
   * Hala Sprint (Memberzone – Sportoviste.aspx)
   * Fit4All (online-rezervace?date=…&activity=6)
@@ -16,14 +16,16 @@ Spuštění:
     python badminton_brno.py --export site               # statický web pro mobil (GitHub Pages)
     python badminton_brno.py --dump-xarena 25.11.2026    # ladění jednotlivých hal
     python badminton_brno.py --dump-viktoria 25.11.2026
+    python badminton_brno.py --dump-kuklenska 25.11.2026
     python badminton_brno.py --dump-memberzone 01.12.2026
     python badminton_brno.py --dump-sprint
     python badminton_brno.py --dump-fit4all 25.11.2026
 
 JAK PŘIDAT DALŠÍ HALU / KURTY (viz KONFIGURACE níže):
-  * Reenio (jako TJ Tesla)        -> přidat kurt do VENUES[..]["resources"] nebo novou položku do VENUES
-  * Memberzone Sportoviste.aspx   -> přidat položku do SPORTOVISTE (stačí URL stránky sportoviště)
-  * jiný rezervační systém        -> potřeba nový adaptér (pošlete cURL)
+  * Reenio (jako TJ Tesla)          -> přidat kurt do VENUES[..]["resources"] nebo novou položku do VENUES
+  * Clubspire (jako Viktoria)       -> přidat položku do CLUBSPIRE (adresa + "sport_name")
+  * Memberzone Sportoviste.aspx     -> přidat položku do SPORTOVISTE (stačí URL stránky sportoviště)
+  * jiný rezervační systém          -> potřeba nový adaptér (pošlete cURL)
   * u každé haly lze vyplnit "maps" = odkaz na Google Mapy (zobrazí se 📍 v záhlaví)
 """
 import argparse, json, os, re, threading, time, html as htmlmod, datetime as dt
@@ -70,18 +72,37 @@ XARENA = {
     "cookie": "",
 }
 
-# --- Clubspire timeline
-VIKTORIA = {
-    "name": "Centrum Viktoria",
-    "maps": "https://maps.app.goo.gl/JddTpoGSQcCJxsYu8",
-    "base": "https://rezervace.centrumviktoria.cz:18443",
-    "sport_index": 1,      # tc[1].s=true = badminton
-    "sport_count": 5,
-    "days_ahead": 14,
-    "parallel": 1,         # server shazuje souběžná spojení
-    "delay": 1.0,
-    "enabled": True,       # False = nenačítat (např. na firemní VPN, která Viktorii blokuje)
-}
+# --- Clubspire timeline (Viktoria, Kuklenská, …)
+#   sport_index / sport_count = pořadí sportu v zaškrtávátkách tc[i].s; None = zjistí se ze stránky podle sport_name
+CLUBSPIRE = [
+    {
+        "name": "Centrum Viktoria",
+        "maps": "https://maps.app.goo.gl/JddTpoGSQcCJxsYu8",
+        "base": "https://rezervace.centrumviktoria.cz:18443",
+        "sport_name": "Badminton",
+        "sport_index": 1,          # ověřeno z cURL
+        "sport_count": 5,
+        "days_ahead": 14,
+        "parallel": 1,             # server shazuje souběžná spojení
+        "delay": 1.0,
+        "enabled": True,           # False = nenačítat (např. na firemní VPN)
+    },
+    {
+        "name": "Kuklenská",
+        "maps": "https://maps.app.goo.gl/bTSvdZsgowqxTm9M6",
+        "base": "https://kuklenska.clubspire.cz",
+        "sport_name": "Badminton",
+        "sport_index": 0,          # ověřeno z cURL: jediný sport tc[0]
+        "sport_count": 1,
+        "extra": {"check_all": "on"},
+        "block": 60,               # hodinové sloupce (cena je uvedena za 15 min)
+        "days_ahead": 14,
+        "parallel": 1,
+        "delay": 1.0,
+        "enabled": True,
+    },
+]
+VIKTORIA = CLUBSPIRE[0]           # zpětná kompatibilita
 
 # --- Memberzone rozpis (Ivanovice)
 MEMBERZONE = {
@@ -115,7 +136,7 @@ FIT4ALL = {
 }
 
 # pořadí sloupců v mřížce + odkazy na mapy
-_ALL_CFG = VENUES + [XARENA, VIKTORIA, MEMBERZONE] + SPORTOVISTE + [FIT4ALL]
+_ALL_CFG = VENUES + [XARENA] + CLUBSPIRE + [MEMBERZONE] + SPORTOVISTE + [FIT4ALL]
 VENUE_ORDER = [c["name"] for c in _ALL_CFG]
 VENUE_MAPS = {c["name"]: c.get("maps", "") for c in _ALL_CFG}
 
@@ -312,14 +333,21 @@ class XarenaClient:
                 tried.append(f"{sid.split(':')[1]}{'+nová session' if fresh else ''} -> {info}")
         raise RuntimeError(f"Xarena nevrátila den {date:%d.%m.%Y} (zkoušeno: {'; '.join(tried)})")
 
-# ---------------------------------------------------------------- ADAPTÉR CENTRUM VIKTORIA
-class ViktoriaClient:
+# ---------------------------------------------------------------- ADAPTÉR CLUBSPIRE (Viktoria, Kuklenská)
+class ClubspireClient:
+    """
+    POST /timeline/day: tc[i].s = zaškrtnutý sport, criteriaTimestamp = den (ms), _csrf = token ze stránky.
+    Pořadí sportu (sport_index) a jejich počet se zjistí ze stránky, pokud nejsou v konfiguraci.
+    """
     def __init__(self, cfg=VIKTORIA):
         self.c = cfg
         self.s = requests.Session()
         self.s.headers.update({"user-agent": UA, "accept-language": "cs,en;q=0.9", "Connection": "close"})
         self.csrf = None
         self.first_html = ""
+        self.index = cfg.get("sport_index")
+        self.count = cfg.get("sport_count")
+        self.sports = {}            # zjištěné sporty: index -> název
 
     @staticmethod
     def _csrf(html):
@@ -329,11 +357,36 @@ class ViktoriaClient:
              re.search(r'<meta[^>]*content="([^"]+)"[^>]*name="_csrf"', html))
         return m.group(1) if m else None
 
+    def _detect_sports(self, html):
+        idx = sorted({int(i) for i in re.findall(r'name="_?tc\[(\d+)\]\.s"', html)})
+        if idx and not self.count:
+            self.count = max(idx) + 1
+        # názvy sportů: <label for="tc0.s1">Badminton</label>, případně text za inputem
+        for i, label in re.findall(r'<label[^>]*for="tc(\d+)\.s\d*"[^>]*>(.*?)</label>', html, re.S):
+            self.sports[int(i)] = re.sub(r"<[^>]+>|\s+", " ", label).strip()
+        if not self.sports:
+            pos = [(int(m.group(1)), m.start()) for m in re.finditer(r'name="tc\[(\d+)\]\.s"', html)]
+            for k, (i, p) in enumerate(pos):
+                end = pos[k + 1][1] if k + 1 < len(pos) else p + 800
+                txt = re.sub(r"<[^>]+>|\s+", " ", html[p:end])
+                txt = re.sub(r'^.*?>', "", txt).strip()
+                self.sports[i] = txt[:60]
+        if self.index is None:
+            want = (self.c.get("sport_name") or "badminton").lower()
+            for i, label in sorted(self.sports.items()):
+                if want in label.lower():
+                    self.index = i
+                    break
+
     def _init_session(self):
-        r = self.s.get(self.c["base"] + "/timeline/day", timeout=20)
+        r = self.s.get(self.c["base"] + "/timeline/day?lang=cs", timeout=20)
         r.raise_for_status()
         self.first_html = r.text
         self.csrf = self._csrf(r.text)
+        self._detect_sports(r.text)
+        if self.index is None:
+            raise RuntimeError(f"nenašel jsem sport „{self.c.get('sport_name')}“ (nalezeno: "
+                               f"{', '.join(f'{k}={v}' for k, v in sorted(self.sports.items())) or 'nic'})")
 
     @staticmethod
     def _ts(date):
@@ -346,10 +399,11 @@ class ViktoriaClient:
         if not self.csrf:
             self._init_session()
         data = []
-        for i in range(self.c["sport_count"]):
-            if i == self.c["sport_index"]:
+        for i in range(self.count or (self.index + 1)):
+            if i == self.index:
                 data.append((f"tc[{i}].s", "true"))
             data.append((f"_tc[{i}].s", "on"))
+        data += list(self.c.get("extra", {}).items())
         data += [("criteriaTimestamp", str(self._ts(date))), ("_csrf", self.csrf or "")]
         r = self.s.post(self.c["base"] + "/timeline/day", data=data, timeout=20, headers={
             "Accept": "*/*", "Origin": self.c["base"], "Referer": self.c["base"] + "/timeline/day",
@@ -358,6 +412,8 @@ class ViktoriaClient:
         r.raise_for_status()
         self.csrf = self._csrf(r.text) or self.csrf
         return r.text
+
+ViktoriaClient = ClubspireClient   # zpětná kompatibilita
 
 # ---------------------------------------------------------------- ADAPTÉR MEMBERZONE ROZPIS (Ivanovice)
 class MemberzoneClient:
@@ -649,12 +705,14 @@ def parse_xarena(html, now=None, day=None):
                         "free": (c, r) not in busy, "opens": None, "price": None, "block": 60})
     return out
 
-# ---------------------------------------------------------------- PARSER Viktoria
+# ---------------------------------------------------------------- PARSER Clubspire (Viktoria, Kuklenská)
 _VK_CELL = re.compile(
-    r'<td class="([^"]*)">\s*<div class=\'holder\'>\s*<a class=\'book ajax_popup_trigger\'\s+'
+    r'<td class="([^"]*)"[^>]*>\s*<div class=\'holder\'>\s*<a class=\'book ajax_popup_trigger\'\s+'
     r'href=\'([^\']*reservationStartTime/(\d{4}-\d\d-\d\dT\d\d:\d\d)[^\']*)\'(.*?)</td>', re.S)
 
-def parse_viktoria(html, now=None):
+def parse_clubspire(html, now=None, block=None):
+    """'can_book' = volno, 'full…' = obsazeno (jen náhradník).
+    block = délka slotu v min (Kuklenská má hodinové sloupce, ale cenu uvádí za 15 min)."""
     now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
     out = []
     for m in _VK_CELL.finditer(html):
@@ -664,14 +722,17 @@ def parse_viktoria(html, now=None):
         b0 = dt.datetime.strptime(start, "%Y-%m-%dT%H:%M")
         if b0 < now:
             continue
-        block = int(price.group(2)) if price else 30
+        unit = int(price.group(2)) if price else 30
+        blk = block or unit
         c = cls.split()
         free = "can_book" in c and not any(x.startswith("full") for x in c)
         out.append({"court": court.group(1) if court else "?", "start": b0.strftime("%Y-%m-%d %H:%M"),
-                    "end": (b0 + dt.timedelta(minutes=block)).strftime("%Y-%m-%d %H:%M"),
-                    "free": free, "opens": None, "block": block,
+                    "end": (b0 + dt.timedelta(minutes=blk)).strftime("%Y-%m-%d %H:%M"),
+                    "free": free, "opens": None, "block": blk, "unit": unit,
                     "price": int(price.group(1)) if price else None})
     return out
+
+parse_viktoria = parse_clubspire   # zpětná kompatibilita
 
 # ---------------------------------------------------------------- PARSER Memberzone rozpis (Ivanovice)
 _MZ_ROW = re.compile(r'<tr id="[^"]*RADEK_DAY_\d+"[^>]*>\s*<td[^>]*class="color_tmava_bcg">([^<]+)</td>(.*?)</tr>', re.S)
@@ -732,10 +793,6 @@ def parse_sportoviste(html, now=None):
 _F4_CELL = re.compile(r'<div\b([^>]*class="court-cell[^"]*"[^>]*)>', re.S)
 
 def parse_fit4all(html, now=None):
-    """
-    Každý 30min slot = <div data-name="Badminton KURT 1" data-date="25.11.2026" data-start-time="7:00"
-    class="court-cell court-cell-free|court-cell-booked ...">.
-    """
     now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
     out = []
     for m in _F4_CELL.finditer(html):
@@ -797,17 +854,17 @@ def _xarena_task(days):
         return view
     return (f'xarena|{days[0]}', run)
 
-def _viktoria_task(days):
+def _clubspire_task(cfg, days):
     def run():
-        with host_slot("viktoria", VIKTORIA["parallel"]):
-            pages, errs = fetch_days(ViktoriaClient, lambda c, d: c.fetch(d), days,
-                                     VIKTORIA["name"], VIKTORIA.get("delay", 0))
+        with host_slot(cfg["base"], cfg.get("parallel", 1)):
+            pages, errs = fetch_days(lambda: ClubspireClient(cfg), lambda c, d: c.fetch(d), days,
+                                     cfg["name"], cfg.get("delay", 0))
         _report(errs)
         def view(now):
-            return [{**t, "venue": VIKTORIA["name"], "link": VIKTORIA["base"] + "/timeline/day"}
-                    for html in pages for t in parse_viktoria(html, now)]
+            return [{**t, "venue": cfg["name"], "link": cfg["base"] + "/timeline/day?lang=cs"}
+                    for html in pages for t in parse_clubspire(html, now, cfg.get("block"))]
         return view
-    return (f'viktoria|{days[0]}', run)
+    return (f'clubspire|{cfg["name"]}|{days[0]}', run)
 
 def _memberzone_task(days):
     def run():
@@ -866,9 +923,10 @@ def build_tasks():
                 tasks.append(_reenio_task(v, rid, court, slug, (today + dt.timedelta(days=off)).isoformat()))
     for ch in _chunks(_days(XARENA["days_ahead"]), XARENA["parallel"]):
         tasks.append(_xarena_task(ch))
-    if VIKTORIA.get("enabled", True):
-        for ch in _chunks(_days(VIKTORIA["days_ahead"]), VIKTORIA["parallel"]):
-            tasks.append(_viktoria_task(ch))
+    for cfg in CLUBSPIRE:
+        if cfg.get("enabled", True):
+            for ch in _chunks(_days(cfg["days_ahead"]), cfg.get("parallel", 1)):
+                tasks.append(_clubspire_task(cfg, ch))
     for ch in _chunks(_days(MEMBERZONE["days_ahead"]), MEMBERZONE["parallel"]):
         tasks.append(_memberzone_task(ch))
     for cfg in SPORTOVISTE:
@@ -944,7 +1002,6 @@ def build_grid(slots, day, show_later):
         while t < end:
             cells.setdefault(t.strftime("%H:%M"), {}).setdefault(s["venue"], []).append(s)
             t += step
-    # celý rozsah dne (i řádky bez volna): od nejdřívějšího do nejpozdějšího času ze všech hal
     day_slots = [s for s in slots if s["start"].startswith(day)]
     t0 = min([s["start"][11:] for s in day_slots] + [GRID_DAY_FROM])
     t1 = max([s["end"][11:] for s in day_slots] + [GRID_DAY_TO])
@@ -974,7 +1031,7 @@ def _cell_html(lst, venue, tm):
     for s in sorted(lst, key=lambda s: _court_key(s["court"])):
         meta = f'{s["start"][11:]}–{s["end"][11:]}'
         if s.get("price"):
-            meta += f' · {s["price"]} Kč/{s["block"]} min'
+            meta += f' · {s["price"]} Kč/{s.get("unit", s["block"])} min'
         if not s["free"]:
             meta += f' · od {s["opens"]}'
         items.append(f'<a class="court{"" if s["free"] else " dim"}" href="{htmlmod.escape(s["link"])}" '
@@ -1036,7 +1093,7 @@ def render_list(slots, day, show_later, show_all):
         if s["free"] is True:   cls, txt = "st-free", "volno"
         elif s["free"] is None: cls, txt = "st-later", f'od {s["opens"]}'
         else:                   cls, txt = "st-busy", "obsazeno"
-        price = f'{s["price"]} Kč / {s.get("block", 30)} min' if s.get("price") else ""
+        price = f'{s["price"]} Kč / {s.get("unit", s.get("block", 30))} min' if s.get("price") else ""
         rows.append(f'<a class="row" href="{htmlmod.escape(s["link"])}" target=_blank rel=noopener>'
                     f'<span class=rt>{s["start"][11:]}–{s["end"][11:]}</span>'
                     f'<span class=rv>{htmlmod.escape(s["venue"])}<small>{htmlmod.escape(s["court"])}</small></span>'
@@ -1193,8 +1250,9 @@ def _errs_html(errs):
             + "".join(f"<div>{htmlmod.escape(e)}</div>" for e in errs) + "</details>")
 
 def _max_days():
-    return max([DAYS_AHEAD, XARENA["days_ahead"] + 1, VIKTORIA["days_ahead"] + 1, MEMBERZONE["days_ahead"] + 1,
-                FIT4ALL["days_ahead"] + 1] + [s.get("days_ahead", DAYS_AHEAD) + 1 for s in SPORTOVISTE])
+    return max([DAYS_AHEAD, XARENA["days_ahead"] + 1, MEMBERZONE["days_ahead"] + 1, FIT4ALL["days_ahead"] + 1]
+               + [c["days_ahead"] + 1 for c in CLUBSPIRE]
+               + [s.get("days_ahead", DAYS_AHEAD) + 1 for s in SPORTOVISTE])
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -1286,7 +1344,7 @@ document.addEventListener('DOMContentLoaded',function(){
 </script>"""
 
 EXPORT_SW = """
-const C='badminton-v3';
+const C='badminton-v4';
 self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll(['./','index.html','manifest.webmanifest','icon-192.png','icon-512.png'])))});
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',e=>{
@@ -1338,11 +1396,31 @@ def _parse_day(arg):
     return (dt.date.today() + dt.timedelta(days=int(arg[1:])) if arg.startswith("+")
             else dt.datetime.strptime(arg, "%d.%m.%Y").date())
 
+def _dump_clubspire(cfg, d, fname):
+    c = ClubspireClient(cfg)
+    try:
+        html = c.fetch(d)
+    except Exception as e:
+        print(f"Chyba: {_short(e)}")
+        if c.first_html:
+            open(fname.replace(".html", "_page.html"), "w", encoding="utf-8").write(c.first_html)
+            print(f"Úvodní stránka uložena: {fname.replace('.html', '_page.html')}")
+        return
+    open(fname, "w", encoding="utf-8").write(html)
+    open(fname.replace(".html", "_page.html"), "w", encoding="utf-8").write(c.first_html)
+    sl = parse_clubspire(html, dt.datetime(2000, 1, 1), cfg.get("block"))
+    print(f"Sporty: {', '.join(f'{k}={v}' for k, v in sorted(c.sports.items())) or '(nezjištěno)'}")
+    print(f"Použit sport index {c.index} z {c.count}; CSRF: {bool(c.csrf)}")
+    print(f"Bloků: {len(sl)}, volných: {sum(s['free'] for s in sl)}, kurty: "
+          f"{', '.join(sorted({s['court'] for s in sl}, key=_court_key)) or '–'}")
+    print(f"Uloženo: {fname}")
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", action="store_true")
     ap.add_argument("--dump-xarena", nargs="?", const="+1", default=None)
     ap.add_argument("--dump-viktoria", nargs="?", const="+1", default=None)
+    ap.add_argument("--dump-kuklenska", nargs="?", const="+1", default=None)
     ap.add_argument("--dump-memberzone", nargs="?", const="+2", default=None)
     ap.add_argument("--dump-sprint", action="store_true")
     ap.add_argument("--dump-fit4all", nargs="?", const="+1", default=None)
@@ -1355,10 +1433,18 @@ if __name__ == "__main__":
         n, errs = export_site(a.export)
         print(f"Export hotov: {a.export}/index.html ({n} slotů, {len(errs)} chyb)")
         for e in errs: print("CHYBA:", e)
+    elif a.dump_kuklenska:
+        _dump_clubspire(next(c for c in CLUBSPIRE if c["name"] == "Kuklenská"),
+                        _parse_day(a.dump_kuklenska), "kuklenska_dump.html")
+    elif a.dump_viktoria:
+        _dump_clubspire(VIKTORIA, _parse_day(a.dump_viktoria), "viktoria_dump.html")
     elif a.dump_fit4all:
         d = _parse_day(a.dump_fit4all)
         fc = Fit4AllClient()
-        html = fc.fetch(d)
+        try:
+            html = fc.fetch(d)
+        except Exception as e:
+            raise SystemExit(f"Chyba: {_short(e)}")
         open("fit4all_dump.html", "w", encoding="utf-8").write(html)
         sl = parse_fit4all(html, dt.datetime(2000, 1, 1))
         print(f"Staženo {fc.day_url(d)}; bloků: {len(sl)}, volných: {sum(s['free'] for s in sl)}")
@@ -1384,15 +1470,6 @@ if __name__ == "__main__":
         open("memberzone_dump.html", "w", encoding="utf-8").write(html)
         sl = parse_memberzone(html, dt.datetime(2000, 1, 1), d) if html else []
         print(f"Zobrazený den {mz.shown_date(html) if html else '–'}; bloků: {len(sl)}, volných: {sum(s['free'] for s in sl)}")
-    elif a.dump_viktoria:
-        d = _parse_day(a.dump_viktoria)
-        vk = ViktoriaClient()
-        try:
-            html = vk.fetch(d)
-        except Exception as e:
-            raise SystemExit(f"Chyba: {_short(e)}")
-        open("viktoria_dump.html", "w", encoding="utf-8").write(html)
-        print(f"CSRF nalezen: {bool(vk.csrf)}; bloků: {len(parse_viktoria(html, dt.datetime(2000, 1, 1)))}")
     elif a.dump_xarena:
         d = _parse_day(a.dump_xarena)
         x = XarenaClient()
